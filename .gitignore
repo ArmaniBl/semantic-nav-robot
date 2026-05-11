@@ -1,0 +1,34 @@
+__pycache__/
+.cache/
+.venv/
+.ruclip_venv/
+qdrant_storage/
+
+# Python/runtime caches
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# ROS/build outputs
+build/
+install/
+log/
+*.bag
+*.db3
+
+# Generated semantic-memory data
+data/keyframes/
+data/exploration_runs/
+
+# Local logs and scratch files
+*.log
+*.tmp
+*Zone.Identifier

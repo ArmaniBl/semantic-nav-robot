@@ -1,0 +1,7 @@
+image: slam_2026-04-26.pgm
+mode: trinary
+resolution: 0.050
+origin: [0.130, -7.738, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
