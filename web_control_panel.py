@@ -2,6 +2,7 @@
 import argparse
 import html
 import json
+import mimetypes
 import os
 import shlex
 import signal
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -307,6 +308,8 @@ def build_nav_command(args: argparse.Namespace, query: str) -> list[str]:
         str(python_path),
         str(script),
         query,
+        "--collection",
+        args.collection,
         "--top-k",
         str(args.top_k),
         "--goal-frame",
@@ -373,6 +376,127 @@ def build_explore_command(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def point_payload_to_memory_item(point: dict, score: float | None = None) -> dict:
+    payload = point.get("payload") or {}
+    pose = payload.get("pose") or {}
+    position = pose.get("position") or {}
+    orientation = pose.get("orientation") or {}
+    return {
+        "id": str(point.get("id", "")),
+        "score": score if score is not None else point.get("score"),
+        "memory_id": payload.get("memory_id") or str(point.get("id", "")),
+        "image_path": payload.get("image_path") or "",
+        "timestamp": payload.get("timestamp"),
+        "image_topic": payload.get("image_topic"),
+        "image_frame": payload.get("image_frame"),
+        "pose_topic": payload.get("pose_topic"),
+        "pose_frame": payload.get("pose_frame"),
+        "child_frame_id": payload.get("child_frame_id"),
+        "pose_age_sec": payload.get("pose_age_sec"),
+        "position": {
+            "x": position.get("x"),
+            "y": position.get("y"),
+            "z": position.get("z"),
+        },
+        "orientation": {
+            "x": orientation.get("x"),
+            "y": orientation.get("y"),
+            "z": orientation.get("z"),
+            "w": orientation.get("w"),
+        },
+        "status": payload.get("status"),
+        "embedding_model": payload.get("embedding_model"),
+    }
+
+
+def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
+    limit = max(1, min(args.memory_limit, 512))
+    url = args.qdrant_url.rstrip("/") + f"/collections/{args.collection}/points/scroll"
+    body = json.dumps(
+        {
+            "limit": limit,
+            "with_payload": True,
+            "with_vector": False,
+        }
+    ).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=args.qdrant_timeout_sec) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    points = (data.get("result") or {}).get("points") or []
+    return {
+        "items": [point_payload_to_memory_item(point) for point in points],
+        "limit": limit,
+        "next_page_offset": (data.get("result") or {}).get("next_page_offset"),
+    }
+
+
+def safe_image_path(raw_path: str) -> Path:
+    if not raw_path:
+        raise ValueError("empty image path")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    resolved = path.resolve()
+    root = PROJECT_ROOT.resolve()
+    if root != resolved and root not in resolved.parents:
+        raise ValueError("image path is outside project root")
+    if not resolved.exists() or not resolved.is_file():
+        raise FileNotFoundError(str(resolved))
+    if resolved.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise ValueError("unsupported image type")
+    return resolved
+
+
+def search_memory_preview(args: argparse.Namespace, query: str) -> dict:
+    python_path = PROJECT_ROOT / ".ruclip_venv" / "bin" / "python"
+    command = [
+        str(python_path),
+        str(PROJECT_ROOT / "semantic_search_qdrant.py"),
+        query,
+        "--url",
+        args.qdrant_url,
+        "--collection",
+        args.collection,
+        "--top-k",
+        "1",
+        "--json",
+    ]
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    result = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=args.memory_search_timeout_sec,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(output or f"semantic search exited with code {result.returncode}")
+    stdout_lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if not stdout_lines:
+        raise RuntimeError("semantic search returned empty output")
+    data = json.loads(stdout_lines[-1])
+    results = data.get("results") or []
+    selected = None
+    if results:
+        point = results[0]
+        selected = point_payload_to_memory_item(point, score=point.get("score"))
+    return {
+        "query": query,
+        "selected": selected,
+        "raw_count": len(results),
+    }
+
+
 def stream_process_output(state: SharedState, proc: subprocess.Popen, kind: str) -> None:
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -417,6 +541,10 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_json({"logs": self.get_logs()})
         elif path == "/api/events":
             self.stream_events()
+        elif path == "/api/memory":
+            self.handle_memory_list()
+        elif path == "/api/memory/image":
+            self.handle_memory_image()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -438,6 +566,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.handle_explore_start()
         elif path == "/api/explore/stop":
             self.handle_explore_stop()
+        elif path == "/api/memory/search":
+            self.handle_memory_search()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -456,25 +586,80 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def send_html(self, body: str) -> None:
         encoded = body.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
 
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
 
     def get_logs(self) -> list[dict]:
         parsed = urlparse(self.path)
         last_id = int(parse_qs(parsed.query).get("after", ["0"])[0])
         with self.state.lock:
             return [item for item in self.state.logs if item["id"] > last_id]
+
+    def handle_memory_list(self) -> None:
+        try:
+            self.send_json(qdrant_scroll_memory(self.app_args))
+        except Exception as exc:
+            self.state.add_log("web", f"Failed to load memory DB: {exc}")
+            self.send_json(
+                {"items": [], "error": str(exc)},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+
+    def handle_memory_image(self) -> None:
+        parsed = urlparse(self.path)
+        raw_path = parse_qs(parsed.query).get("path", [""])[0]
+        try:
+            image_path = safe_image_path(raw_path)
+            content_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
+            data = image_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            return
+        except Exception as exc:
+            self.state.add_log("web", f"Failed to serve memory image: {exc}")
+            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND)
+
+    def handle_memory_search(self) -> None:
+        try:
+            payload = self.read_json()
+            query = str(payload.get("query", "")).strip()
+            if not query:
+                self.send_json({"ok": False, "error": "empty query"}, HTTPStatus.BAD_REQUEST)
+                return
+            preview = search_memory_preview(self.app_args, query)
+            self.send_json({"ok": True, **preview})
+        except subprocess.TimeoutExpired:
+            message = "semantic memory preview timed out"
+            self.state.add_log("web", message)
+            self.send_json({"ok": False, "error": message}, HTTPStatus.GATEWAY_TIMEOUT)
+        except Exception as exc:
+            self.state.add_log("web", f"Failed to search memory preview: {exc}")
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def handle_navigate(self) -> None:
         try:
@@ -931,6 +1116,35 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--panel);
       overflow: hidden;
     }
+    .tabs {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border-bottom: 1px solid var(--line);
+      background: #171a1e;
+    }
+    .tab {
+      height: 44px;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+      border-right: 1px solid var(--line);
+    }
+    .tab:last-child { border-right: 0; }
+    .tab.active {
+      color: var(--text);
+      background: var(--panel);
+      box-shadow: inset 0 -2px 0 var(--accent);
+    }
+    .tab-panel {
+      min-height: 0;
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .tab-panel.active { display: flex; }
     .control {
       flex: 0 0 auto;
       padding: 18px;
@@ -991,6 +1205,39 @@ INDEX_HTML = r"""<!doctype html>
       opacity: 0.55;
       cursor: not-allowed;
     }
+    .selected-match {
+      margin-top: 12px;
+      display: none;
+      grid-template-columns: 88px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+    }
+    .selected-match.visible { display: grid; }
+    .selected-match img {
+      width: 88px;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      border-radius: 4px;
+      background: #0d0f11;
+    }
+    .selected-match strong {
+      display: block;
+      font-size: 13px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .selected-match span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
     .metrics {
       flex: 0 0 auto;
       display: grid;
@@ -1045,6 +1292,87 @@ INDEX_HTML = r"""<!doctype html>
       overflow-wrap: anywhere;
       background: #101316;
     }
+    .memory-toolbar {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .memory-detail {
+      flex: 0 0 auto;
+      display: none;
+      grid-template-columns: 110px minmax(0, 1fr);
+      gap: 10px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #171a1e;
+    }
+    .memory-detail.visible { display: grid; }
+    .memory-detail img {
+      width: 110px;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      border-radius: 4px;
+      background: #0d0f11;
+    }
+    .memory-detail h2 {
+      margin: 0 0 6px;
+      font-size: 14px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .memory-detail p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .memory-grid {
+      min-height: 0;
+      flex: 1;
+      overflow: auto;
+      padding: 12px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: start;
+      gap: 10px;
+      background: #101316;
+    }
+    .memory-card {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      overflow: hidden;
+      cursor: pointer;
+    }
+    .memory-card.selected { border-color: var(--accent); }
+    .memory-card img {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      display: block;
+      background: #0d0f11;
+    }
+    .memory-card div { padding: 8px; }
+    .memory-card strong {
+      display: block;
+      font-size: 12px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .memory-card span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
     .src-web { color: var(--accent); }
     .src-nav { color: #8ab4ff; }
     .src-slam { color: #d8a441; }
@@ -1076,43 +1404,70 @@ INDEX_HTML = r"""<!doctype html>
       <div class="stream"><img src="/camera.mjpg" alt="robot camera"></div>
     </section>
     <aside>
-      <section class="control">
-        <label for="query">Semantic command</label>
-        <div class="query-row">
-          <input id="query" type="text" value="дорога" autocomplete="off">
-          <button id="go">Go</button>
-        </div>
-        <div class="button-row">
-          <button id="startQdrant" class="secondary">Start Qdrant</button>
-          <button id="stopQdrant" class="secondary danger">Stop Qdrant</button>
-        </div>
-        <div class="button-row">
-          <button id="startSlam" class="secondary">Start SLAM/Nav2</button>
-          <button id="stopSlam" class="secondary danger">Stop SLAM/Nav2</button>
-        </div>
-        <div class="button-row">
-          <button id="startExplore" class="secondary">Explore</button>
-          <button id="stopExplore" class="secondary danger">Stop Explore</button>
-        </div>
-        <button id="stop" class="secondary danger">Stop active goal</button>
+      <nav class="tabs">
+        <button id="tabControl" class="tab active" type="button">Control</button>
+        <button id="tabMemory" class="tab" type="button">Memory DB</button>
+      </nav>
+      <section id="panelControl" class="tab-panel active">
+        <section class="control">
+          <label for="query">Semantic command</label>
+          <div class="query-row">
+            <input id="query" type="text" value="дорога" autocomplete="off">
+            <button id="go">Go</button>
+          </div>
+          <div id="selectedMatch" class="selected-match">
+            <img id="selectedMatchImage" alt="selected memory frame">
+            <div>
+              <strong id="selectedMatchTitle">No selected image</strong>
+              <span id="selectedMatchMeta">-</span>
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="startQdrant" class="secondary">Start Qdrant</button>
+            <button id="stopQdrant" class="secondary danger">Stop Qdrant</button>
+          </div>
+          <div class="button-row">
+            <button id="startSlam" class="secondary">Start SLAM/Nav2</button>
+            <button id="stopSlam" class="secondary danger">Stop SLAM/Nav2</button>
+          </div>
+          <div class="button-row">
+            <button id="startExplore" class="secondary">Explore</button>
+            <button id="stopExplore" class="secondary danger">Stop Explore</button>
+          </div>
+          <button id="stop" class="secondary danger">Stop active goal</button>
+        </section>
+        <section class="metrics">
+          <div class="metric"><span>Navigation</span><strong id="navState">idle</strong></div>
+          <div class="metric"><span>Runtime</span><strong id="runtime">-</strong></div>
+          <div class="metric"><span>Qdrant</span><strong id="qdrantState">checking</strong></div>
+          <div class="metric"><span>Qdrant URL</span><strong id="qdrantUrl">-</strong></div>
+          <div class="metric"><span>Explore</span><strong id="exploreState">idle</strong></div>
+          <div class="metric"><span>Explore runtime</span><strong id="exploreRuntime">-</strong></div>
+          <div class="metric"><span>SLAM process</span><strong id="slamProcess">idle</strong></div>
+          <div class="metric"><span>SLAM runtime</span><strong id="slamRuntime">-</strong></div>
+          <div class="metric"><span>SLAM/Nav2</span><strong id="systemState">checking</strong></div>
+          <div class="metric"><span>TF map</span><strong id="tfState">-</strong></div>
+          <div class="metric"><span>Frames</span><strong id="frames">0</strong></div>
+          <div class="metric"><span>Image frame</span><strong id="imageFrame">-</strong></div>
+        </section>
+        <section class="logs">
+          <h2>Execution Log</h2>
+          <pre id="log"></pre>
+        </section>
       </section>
-      <section class="metrics">
-        <div class="metric"><span>Navigation</span><strong id="navState">idle</strong></div>
-        <div class="metric"><span>Runtime</span><strong id="runtime">-</strong></div>
-        <div class="metric"><span>Qdrant</span><strong id="qdrantState">checking</strong></div>
-        <div class="metric"><span>Qdrant URL</span><strong id="qdrantUrl">-</strong></div>
-        <div class="metric"><span>Explore</span><strong id="exploreState">idle</strong></div>
-        <div class="metric"><span>Explore runtime</span><strong id="exploreRuntime">-</strong></div>
-        <div class="metric"><span>SLAM process</span><strong id="slamProcess">idle</strong></div>
-        <div class="metric"><span>SLAM runtime</span><strong id="slamRuntime">-</strong></div>
-        <div class="metric"><span>SLAM/Nav2</span><strong id="systemState">checking</strong></div>
-        <div class="metric"><span>TF map</span><strong id="tfState">-</strong></div>
-        <div class="metric"><span>Frames</span><strong id="frames">0</strong></div>
-        <div class="metric"><span>Image frame</span><strong id="imageFrame">-</strong></div>
-      </section>
-      <section class="logs">
-        <h2>Execution Log</h2>
-        <pre id="log"></pre>
+      <section id="panelMemory" class="tab-panel">
+        <div class="memory-toolbar">
+          <strong id="memoryCount">Memory DB</strong>
+          <button id="refreshMemory" class="secondary" type="button">Refresh</button>
+        </div>
+        <div id="memoryDetail" class="memory-detail">
+          <img id="memoryDetailImage" alt="memory frame">
+          <div>
+            <h2 id="memoryDetailTitle">No image selected</h2>
+            <p id="memoryDetailMeta">-</p>
+          </div>
+        </div>
+        <div id="memoryGrid" class="memory-grid"></div>
       </section>
     </aside>
   </main>
@@ -1131,6 +1486,128 @@ INDEX_HTML = r"""<!doctype html>
       span.textContent = line + "\n";
       logEl.appendChild(span);
       logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function imageUrl(item) {
+      return item && item.image_path ? `/api/memory/image?path=${encodeURIComponent(item.image_path)}` : "";
+    }
+
+    function fmt(value, digits = 2) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(digits) : "-";
+    }
+
+    function itemMeta(item) {
+      const pos = item.position || {};
+      const score = item.score === null || item.score === undefined ? "-" : fmt(item.score, 4);
+      return [
+        `score=${score}`,
+        `frame=${item.pose_frame || "-"}`,
+        `x=${fmt(pos.x)} y=${fmt(pos.y)} z=${fmt(pos.z)}`,
+        `image=${item.image_frame || "-"}`
+      ].join(" · ");
+    }
+
+    function showTab(name) {
+      const control = name === "control";
+      $("tabControl").classList.toggle("active", control);
+      $("tabMemory").classList.toggle("active", !control);
+      $("panelControl").classList.toggle("active", control);
+      $("panelMemory").classList.toggle("active", !control);
+      if (!control) loadMemory();
+    }
+
+    function showSelectedMatch(item) {
+      const box = $("selectedMatch");
+      if (!item) {
+        box.classList.remove("visible");
+        return;
+      }
+      $("selectedMatchImage").src = imageUrl(item);
+      $("selectedMatchTitle").textContent = item.memory_id || "selected memory";
+      $("selectedMatchMeta").textContent = itemMeta(item);
+      box.classList.add("visible");
+      showMemoryDetail(item);
+    }
+
+    function showMemoryDetail(item) {
+      const detail = $("memoryDetail");
+      if (!item) {
+        detail.classList.remove("visible");
+        return;
+      }
+      $("memoryDetailImage").src = imageUrl(item);
+      $("memoryDetailTitle").textContent = item.memory_id || "memory item";
+      const pos = item.position || {};
+      $("memoryDetailMeta").textContent = [
+        itemMeta(item),
+        `timestamp=${item.timestamp ?? "-"}`,
+        `topic=${item.image_topic || "-"}`,
+        `path=${item.image_path || "-"}`
+      ].join("\n");
+      detail.classList.add("visible");
+      document.querySelectorAll(".memory-card").forEach((card) => {
+        card.classList.toggle("selected", card.dataset.memoryId === item.memory_id);
+      });
+    }
+
+    function renderMemory(items) {
+      const grid = $("memoryGrid");
+      grid.textContent = "";
+      $("memoryCount").textContent = `Memory DB (${items.length})`;
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "memory-card";
+        empty.innerHTML = "<div><strong>No memory records</strong><span>Qdrant returned no points</span></div>";
+        grid.appendChild(empty);
+        showMemoryDetail(null);
+        return;
+      }
+      for (const item of items) {
+        const card = document.createElement("article");
+        card.className = "memory-card";
+        card.dataset.memoryId = item.memory_id || "";
+        const img = document.createElement("img");
+        img.src = imageUrl(item);
+        img.alt = item.memory_id || "memory frame";
+        const body = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = item.memory_id || "memory item";
+        const meta = document.createElement("span");
+        meta.textContent = itemMeta(item);
+        body.append(title, meta);
+        card.append(img, body);
+        card.addEventListener("click", () => showMemoryDetail(item));
+        grid.appendChild(card);
+      }
+      showMemoryDetail(items[0]);
+    }
+
+    async function loadMemory() {
+      try {
+        const res = await fetch("/api/memory", { cache: "no-store" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Memory request failed");
+        renderMemory(data.items || []);
+      } catch (err) {
+        $("memoryCount").textContent = "Memory DB unavailable";
+        $("memoryGrid").textContent = "";
+        showMemoryDetail(null);
+      }
+    }
+
+    async function previewSemanticMatch(query) {
+      try {
+        const res = await fetch("/api/memory/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query })
+        });
+        const data = await res.json();
+        if (res.ok && data.selected) showSelectedMatch(data.selected);
+      } catch (err) {
+        console.warn("Semantic preview failed", err);
+      }
     }
 
     async function refreshStatus() {
@@ -1175,6 +1652,7 @@ INDEX_HTML = r"""<!doctype html>
     async function navigate() {
       const query = $("query").value.trim();
       if (!query) return;
+      previewSemanticMatch(query);
       const res = await fetch("/api/navigate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1230,6 +1708,9 @@ INDEX_HTML = r"""<!doctype html>
     $("stopSlam").addEventListener("click", stopSlam);
     $("startExplore").addEventListener("click", startExplore);
     $("stopExplore").addEventListener("click", stopExplore);
+    $("tabControl").addEventListener("click", () => showTab("control"));
+    $("tabMemory").addEventListener("click", () => showTab("memory"));
+    $("refreshMemory").addEventListener("click", loadMemory);
     $("query").addEventListener("keydown", (event) => {
       if (event.key === "Enter") navigate();
     });
@@ -1260,6 +1741,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-name", default="/navigate_to_pose")
     parser.add_argument("--robot-base-frame", default="base_link")
     parser.add_argument("--qdrant-url", default="http://127.0.0.1:6333")
+    parser.add_argument("--collection", default="semantic_visual_memory")
+    parser.add_argument("--qdrant-timeout-sec", type=float, default=2.0)
+    parser.add_argument("--memory-limit", type=int, default=200)
+    parser.add_argument("--memory-search-timeout-sec", type=float, default=45.0)
     parser.add_argument("--stream-width", type=int, default=640)
     parser.add_argument("--jpeg-quality", type=int, default=70)
     parser.add_argument("--max-stream-fps", type=float, default=3.0)

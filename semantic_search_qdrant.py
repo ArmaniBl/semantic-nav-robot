@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 from pathlib import Path
 
 import requests
@@ -101,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Torch device. Default: cuda if available, otherwise cpu.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of text output.",
+    )
     return parser.parse_args()
 
 
@@ -132,6 +138,28 @@ def main() -> None:
         with_payload=True,
         with_vectors=False,
     ).points
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "query": args.query,
+                    "collection": args.collection,
+                    "qdrant_url": args.url,
+                    "device": device,
+                    "results": [
+                        {
+                            "id": str(point.id),
+                            "score": point.score,
+                            "payload": point.payload or {},
+                        }
+                        for point in results
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
 
     print(f"Query: {args.query}")
     print(f"Collection: {args.collection}")
