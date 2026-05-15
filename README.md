@@ -31,9 +31,11 @@ From the web panel:
 4. Use `Explore` to collect keyframes and rebuild semantic memory.
 5. Use the semantic command input and `Go` to navigate by text query.
 
-The `Memory DB` tab shows keyframes currently stored in Qdrant, including image,
-pose frame, coordinates, score, topics, and file path. When `Go` is pressed, the
-panel also shows the image selected by semantic search for that text query.
+The `Memory DB` tab shows keyframes from exploration runs, including image, pose
+frame, coordinates, score when available, topics, and file path. The newest
+`data/exploration_runs/run_*` folder is selected by default, and the tab also
+shows which run is currently loaded into Qdrant. When `Go` is pressed, the panel
+shows the image selected by semantic search for that text query.
 
 ## Stop Runtime Processes
 

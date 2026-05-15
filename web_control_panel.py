@@ -30,6 +30,7 @@ from tf2_ros import Buffer, TransformListener
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_IMAGE_TOPIC = "/front_stereo_camera/left/image_raw"
+EXPLORATION_RUNS_DIR = PROJECT_ROOT / "data" / "exploration_runs"
 
 
 def stamp_to_sec(msg) -> float:
@@ -386,6 +387,7 @@ def point_payload_to_memory_item(point: dict, score: float | None = None) -> dic
         "score": score if score is not None else point.get("score"),
         "memory_id": payload.get("memory_id") or str(point.get("id", "")),
         "image_path": payload.get("image_path") or "",
+        "run_id": run_id_from_path(payload.get("image_path") or ""),
         "timestamp": payload.get("timestamp"),
         "image_topic": payload.get("image_topic"),
         "image_frame": payload.get("image_frame"),
@@ -409,6 +411,104 @@ def point_payload_to_memory_item(point: dict, score: float | None = None) -> dic
     }
 
 
+def run_id_from_path(raw_path: str) -> str | None:
+    if not raw_path:
+        return None
+    parts = Path(raw_path).parts
+    for index, part in enumerate(parts[:-1]):
+        if part == "exploration_runs" and index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    records = []
+    with path.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def list_exploration_runs() -> list[dict]:
+    runs = []
+    if not EXPLORATION_RUNS_DIR.exists():
+        return runs
+    for run_dir in sorted(EXPLORATION_RUNS_DIR.glob("run_*")):
+        if not run_dir.is_dir():
+            continue
+        keyframes_dir = run_dir / "keyframes"
+        metadata_path = keyframes_dir / "metadata.jsonl"
+        images_dir = keyframes_dir / "images"
+        image_count = len(list(images_dir.glob("*.png"))) if images_dir.exists() else 0
+        embeddings_path = keyframes_dir / "embeddings.jsonl"
+        runs.append(
+            {
+                "id": run_dir.name,
+                "path": str(run_dir),
+                "metadata": str(metadata_path),
+                "has_metadata": metadata_path.exists(),
+                "has_embeddings": embeddings_path.exists(),
+                "image_count": image_count,
+                "mtime": run_dir.stat().st_mtime,
+            }
+        )
+    runs.sort(key=lambda item: (item["mtime"], item["id"]), reverse=True)
+    return runs
+
+
+def metadata_record_to_memory_item(record: dict, run_id: str) -> dict:
+    pose = record.get("pose") or {}
+    position = pose.get("position") or {}
+    orientation = pose.get("orientation") or {}
+    return {
+        "id": record.get("memory_id") or "",
+        "score": None,
+        "memory_id": record.get("memory_id") or "",
+        "image_path": record.get("image_path") or "",
+        "run_id": run_id,
+        "timestamp": record.get("timestamp"),
+        "image_topic": record.get("image_topic"),
+        "image_frame": record.get("image_frame"),
+        "pose_topic": record.get("pose_topic"),
+        "pose_frame": record.get("pose_frame"),
+        "child_frame_id": record.get("child_frame_id"),
+        "pose_age_sec": record.get("pose_age_sec"),
+        "position": {
+            "x": position.get("x"),
+            "y": position.get("y"),
+            "z": position.get("z"),
+        },
+        "orientation": {
+            "x": orientation.get("x"),
+            "y": orientation.get("y"),
+            "z": orientation.get("z"),
+            "w": orientation.get("w"),
+        },
+        "status": record.get("status", "active"),
+        "embedding_model": None,
+    }
+
+
+def load_run_memory(run_id: str) -> dict:
+    runs = list_exploration_runs()
+    if run_id in ("", "latest"):
+        run = runs[0] if runs else None
+    else:
+        run = next((item for item in runs if item["id"] == run_id), None)
+    if run is None:
+        return {"items": [], "runs": runs, "selected_run": None}
+    metadata_path = Path(run["metadata"])
+    records = read_jsonl(metadata_path) if metadata_path.exists() else []
+    return {
+        "items": [metadata_record_to_memory_item(record, run["id"]) for record in records],
+        "runs": runs,
+        "selected_run": run["id"],
+        "selected_run_info": run,
+    }
+
+
 def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
     limit = max(1, min(args.memory_limit, 512))
     url = args.qdrant_url.rstrip("/") + f"/collections/{args.collection}/points/scroll"
@@ -428,10 +528,16 @@ def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
     with urlopen(request, timeout=args.qdrant_timeout_sec) as response:
         data = json.loads(response.read().decode("utf-8"))
     points = (data.get("result") or {}).get("points") or []
+    items = [point_payload_to_memory_item(point) for point in points]
+    run_counts: dict[str, int] = {}
+    for item in items:
+        run_id = item.get("run_id") or "<unknown>"
+        run_counts[run_id] = run_counts.get(run_id, 0) + 1
     return {
-        "items": [point_payload_to_memory_item(point) for point in points],
+        "items": items,
         "limit": limit,
         "next_page_offset": (data.get("result") or {}).get("next_page_offset"),
+        "qdrant_run_counts": run_counts,
     }
 
 
@@ -614,7 +720,20 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def handle_memory_list(self) -> None:
         try:
-            self.send_json(qdrant_scroll_memory(self.app_args))
+            parsed = urlparse(self.path)
+            run_id = parse_qs(parsed.query).get("run", ["latest"])[0]
+            try:
+                qdrant_memory = qdrant_scroll_memory(self.app_args)
+            except Exception as exc:
+                qdrant_memory = {"items": [], "qdrant_run_counts": {}, "qdrant_error": str(exc)}
+            if run_id == "qdrant":
+                payload = qdrant_memory
+                payload["runs"] = list_exploration_runs()
+                payload["selected_run"] = "qdrant"
+            else:
+                payload = load_run_memory(run_id)
+                payload["qdrant_run_counts"] = qdrant_memory.get("qdrant_run_counts", {})
+            self.send_json(payload)
         except Exception as exc:
             self.state.add_log("web", f"Failed to load memory DB: {exc}")
             self.send_json(
@@ -1048,7 +1167,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 100vh;
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 380px;
+      grid-template-columns: minmax(0, 1fr) 320px;
       gap: 0;
       overflow: hidden;
     }
@@ -1060,7 +1179,7 @@ INDEX_HTML = r"""<!doctype html>
       border-right: 1px solid var(--line);
     }
     .topbar {
-      min-height: 56px;
+      min-height: 44px;
       flex: 0 0 auto;
       display: flex;
       align-items: center;
@@ -1071,7 +1190,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .title {
       font-weight: 650;
-      font-size: 16px;
+      font-size: 14px;
       line-height: 1.2;
     }
     .status {
@@ -1079,7 +1198,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       gap: 8px;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       white-space: nowrap;
     }
     .dot {
@@ -1147,7 +1266,7 @@ INDEX_HTML = r"""<!doctype html>
     .tab-panel.active { display: flex; }
     .control {
       flex: 0 0 auto;
-      padding: 18px;
+      padding: 12px;
       border-bottom: 1px solid var(--line);
     }
     label {
@@ -1165,30 +1284,30 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 8px;
-      margin-top: 10px;
+      margin-top: 8px;
     }
-    input {
+    input, select {
       width: 100%;
       min-width: 0;
-      height: 42px;
+      height: 36px;
       border: 1px solid var(--line);
       background: #101316;
       color: var(--text);
       border-radius: 6px;
       padding: 0 12px;
-      font-size: 15px;
+      font-size: 13px;
       outline: none;
     }
-    input:focus { border-color: var(--accent); }
+    input:focus, select:focus { border-color: var(--accent); }
     button {
-      height: 42px;
+      height: 36px;
       border: 0;
       border-radius: 6px;
       padding: 0 14px;
       background: var(--accent);
       color: #061412;
       font-weight: 700;
-      font-size: 14px;
+      font-size: 13px;
       cursor: pointer;
     }
     button.secondary {
@@ -1243,12 +1362,12 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 10px;
-      padding: 14px 18px;
+      padding: 10px 12px;
       border-bottom: 1px solid var(--line);
     }
     .metric {
-      min-height: 58px;
-      padding: 10px;
+      min-height: 50px;
+      padding: 8px;
       border-radius: 6px;
       background: var(--panel-2);
       border: 1px solid var(--line);
@@ -1261,7 +1380,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .metric strong {
       display: block;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 650;
       line-height: 1.25;
       overflow-wrap: anywhere;
@@ -1292,18 +1411,48 @@ INDEX_HTML = r"""<!doctype html>
       overflow-wrap: anywhere;
       background: #101316;
     }
+    .memory-grid::-webkit-scrollbar,
+    pre::-webkit-scrollbar,
+    .tab-panel::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    .memory-grid::-webkit-scrollbar-thumb,
+    pre::-webkit-scrollbar-thumb,
+    .tab-panel::-webkit-scrollbar-thumb {
+      background: #4a535f;
+      border-radius: 999px;
+      border: 2px solid #101316;
+    }
+    .memory-grid::-webkit-scrollbar-track,
+    pre::-webkit-scrollbar-track,
+    .tab-panel::-webkit-scrollbar-track {
+      background: #101316;
+    }
     .memory-toolbar {
       flex: 0 0 auto;
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 8px;
       padding: 12px;
       border-bottom: 1px solid var(--line);
     }
+    .memory-run {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 6px;
+    }
+    .memory-run span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
     .memory-detail {
       flex: 0 0 auto;
       display: none;
-      grid-template-columns: 110px minmax(0, 1fr);
+      grid-template-columns: 1fr;
       gap: 10px;
       padding: 12px;
       border-bottom: 1px solid var(--line);
@@ -1311,8 +1460,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .memory-detail.visible { display: grid; }
     .memory-detail img {
-      width: 110px;
-      aspect-ratio: 4 / 3;
+      width: 100%;
+      max-height: 260px;
       object-fit: cover;
       border-radius: 4px;
       background: #0d0f11;
@@ -1337,7 +1486,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow: auto;
       padding: 12px;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       align-content: start;
       gap: 10px;
       background: #101316;
@@ -1353,8 +1502,8 @@ INDEX_HTML = r"""<!doctype html>
     .memory-card.selected { border-color: var(--accent); }
     .memory-card img {
       width: 100%;
-      aspect-ratio: 4 / 3;
-      object-fit: cover;
+      height: clamp(180px, 24vh, 280px);
+      object-fit: contain;
       display: block;
       background: #0d0f11;
     }
@@ -1459,6 +1608,10 @@ INDEX_HTML = r"""<!doctype html>
         <div class="memory-toolbar">
           <strong id="memoryCount">Memory DB</strong>
           <button id="refreshMemory" class="secondary" type="button">Refresh</button>
+          <div class="memory-run">
+            <select id="memoryRun"></select>
+            <span id="memoryRunInfo">-</span>
+          </div>
         </div>
         <div id="memoryDetail" class="memory-detail">
           <img id="memoryDetailImage" alt="memory frame">
@@ -1475,6 +1628,7 @@ INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const logEl = $("log");
     let lastLogId = 0;
+    let currentMemoryRun = "latest";
 
     function addLog(item) {
       if (item.id <= lastLogId) return;
@@ -1502,6 +1656,7 @@ INDEX_HTML = r"""<!doctype html>
       const score = item.score === null || item.score === undefined ? "-" : fmt(item.score, 4);
       return [
         `score=${score}`,
+        `run=${item.run_id || "-"}`,
         `frame=${item.pose_frame || "-"}`,
         `x=${fmt(pos.x)} y=${fmt(pos.y)} z=${fmt(pos.z)}`,
         `image=${item.image_frame || "-"}`
@@ -1551,14 +1706,51 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
 
-    function renderMemory(items) {
+    function qdrantInfo(runCounts) {
+      const entries = Object.entries(runCounts || {});
+      if (!entries.length) return "Qdrant source: empty/unknown";
+      return `Qdrant source: ${entries.map(([run, count]) => `${run} (${count})`).join(", ")}`;
+    }
+
+    function populateRunSelector(runs, selectedRun) {
+      const select = $("memoryRun");
+      const previous = select.value;
+      select.textContent = "";
+      const qdrantOption = document.createElement("option");
+      qdrantOption.value = "qdrant";
+      qdrantOption.textContent = "Current Qdrant collection";
+      select.appendChild(qdrantOption);
+      for (const run of runs || []) {
+        const option = document.createElement("option");
+        option.value = run.id;
+        const suffix = run.has_embeddings ? "embeddings" : "metadata only";
+        option.textContent = `${run.id} · ${run.image_count} images · ${suffix}`;
+        select.appendChild(option);
+      }
+      if (selectedRun && [...select.options].some((option) => option.value === selectedRun)) {
+        select.value = selectedRun;
+      } else if (previous && [...select.options].some((option) => option.value === previous)) {
+        select.value = previous;
+      } else if (runs && runs.length) {
+        select.value = runs[0].id;
+      } else {
+        select.value = "qdrant";
+      }
+      currentMemoryRun = select.value;
+    }
+
+    function renderMemory(data) {
+      const items = data.items || [];
       const grid = $("memoryGrid");
       grid.textContent = "";
+      populateRunSelector(data.runs || [], data.selected_run);
       $("memoryCount").textContent = `Memory DB (${items.length})`;
+      const selectedLabel = data.selected_run === "qdrant" ? "Current Qdrant collection" : (data.selected_run || "-");
+      $("memoryRunInfo").textContent = `${selectedLabel} · ${qdrantInfo(data.qdrant_run_counts)}`;
       if (!items.length) {
         const empty = document.createElement("div");
         empty.className = "memory-card";
-        empty.innerHTML = "<div><strong>No memory records</strong><span>Qdrant returned no points</span></div>";
+        empty.innerHTML = "<div><strong>No memory records</strong><span>The selected run has no metadata/images</span></div>";
         grid.appendChild(empty);
         showMemoryDetail(null);
         return;
@@ -1585,12 +1777,13 @@ INDEX_HTML = r"""<!doctype html>
 
     async function loadMemory() {
       try {
-        const res = await fetch("/api/memory", { cache: "no-store" });
+        const res = await fetch(`/api/memory?run=${encodeURIComponent(currentMemoryRun)}`, { cache: "no-store" });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Memory request failed");
-        renderMemory(data.items || []);
+        renderMemory(data);
       } catch (err) {
         $("memoryCount").textContent = "Memory DB unavailable";
+        $("memoryRunInfo").textContent = String(err);
         $("memoryGrid").textContent = "";
         showMemoryDetail(null);
       }
@@ -1711,6 +1904,10 @@ INDEX_HTML = r"""<!doctype html>
     $("tabControl").addEventListener("click", () => showTab("control"));
     $("tabMemory").addEventListener("click", () => showTab("memory"));
     $("refreshMemory").addEventListener("click", loadMemory);
+    $("memoryRun").addEventListener("change", () => {
+      currentMemoryRun = $("memoryRun").value || "latest";
+      loadMemory();
+    });
     $("query").addEventListener("keydown", (event) => {
       if (event.key === "Enter") navigate();
     });
