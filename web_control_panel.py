@@ -458,6 +458,18 @@ def list_exploration_runs() -> list[dict]:
     return runs
 
 
+def find_exploration_run(run_id: str) -> dict:
+    runs = list_exploration_runs()
+    if run_id in ("", "latest"):
+        if not runs:
+            raise FileNotFoundError("No exploration runs found")
+        return runs[0]
+    for run in runs:
+        if run["id"] == run_id:
+            return run
+    raise FileNotFoundError(f"Exploration run not found: {run_id}")
+
+
 def metadata_record_to_memory_item(record: dict, run_id: str) -> dict:
     pose = record.get("pose") or {}
     position = pose.get("position") or {}
@@ -493,11 +505,9 @@ def metadata_record_to_memory_item(record: dict, run_id: str) -> dict:
 
 def load_run_memory(run_id: str) -> dict:
     runs = list_exploration_runs()
-    if run_id in ("", "latest"):
-        run = runs[0] if runs else None
-    else:
-        run = next((item for item in runs if item["id"] == run_id), None)
-    if run is None:
+    try:
+        run = find_exploration_run(run_id)
+    except FileNotFoundError:
         return {"items": [], "runs": runs, "selected_run": None}
     metadata_path = Path(run["metadata"])
     records = read_jsonl(metadata_path) if metadata_path.exists() else []
@@ -506,6 +516,71 @@ def load_run_memory(run_id: str) -> dict:
         "runs": runs,
         "selected_run": run["id"],
         "selected_run_info": run,
+    }
+
+
+def run_command_capture(command: list[str], timeout_sec: float) -> str:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    result = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    output = result.stdout or ""
+    if result.returncode != 0:
+        raise RuntimeError(output.strip() or f"command exited with code {result.returncode}")
+    return output
+
+
+def load_run_into_qdrant(args: argparse.Namespace, run_id: str) -> dict:
+    run = find_exploration_run(run_id)
+    metadata_path = Path(run["metadata"])
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Run has no metadata: {metadata_path}")
+    embeddings_path = metadata_path.parent / "embeddings.jsonl"
+    python_path = PROJECT_ROOT / ".ruclip_venv" / "bin" / "python"
+
+    embed_output = ""
+    if not embeddings_path.exists():
+        embed_output = run_command_capture(
+            [
+                str(python_path),
+                str(PROJECT_ROOT / "ruclip_embed_keyframes.py"),
+                "--metadata",
+                str(metadata_path),
+                "--output",
+                str(embeddings_path),
+            ],
+            args.memory_load_timeout_sec,
+        )
+
+    load_output = run_command_capture(
+        [
+            str(python_path),
+            str(PROJECT_ROOT / "qdrant_load_keyframes.py"),
+            "--embeddings",
+            str(embeddings_path),
+            "--url",
+            args.qdrant_url,
+            "--collection",
+            args.collection,
+            "--recreate",
+        ],
+        args.memory_load_timeout_sec,
+    )
+    return {
+        "run": run["id"],
+        "metadata": str(metadata_path),
+        "embeddings": str(embeddings_path),
+        "embedded": bool(embed_output),
+        "embed_output": embed_output,
+        "load_output": load_output,
     }
 
 
@@ -674,6 +749,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.handle_explore_stop()
         elif path == "/api/memory/search":
             self.handle_memory_search()
+        elif path == "/api/memory/load-run":
+            self.handle_memory_load_run()
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -775,6 +852,30 @@ class ControlHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": message}, HTTPStatus.GATEWAY_TIMEOUT)
         except Exception as exc:
             self.state.add_log("web", f"Failed to search memory preview: {exc}")
+            self.send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def handle_memory_load_run(self) -> None:
+        try:
+            payload = self.read_json()
+            run_id = str(payload.get("run", "")).strip()
+            if run_id in ("", "latest"):
+                run_id = find_exploration_run(run_id)["id"]
+            if run_id == "qdrant":
+                self.send_json({"ok": True, "loaded": False, "run": "qdrant"})
+                return
+            self.state.add_log("web", f"loading memory run into Qdrant: {run_id}")
+            result = load_run_into_qdrant(self.app_args, run_id)
+            self.state.add_log("web", f"loaded memory run into Qdrant: {run_id}")
+            self.send_json({"ok": True, "loaded": True, **result})
+        except subprocess.TimeoutExpired:
+            message = "memory run load timed out"
+            self.state.add_log("web", message)
+            self.send_json({"ok": False, "error": message}, HTTPStatus.GATEWAY_TIMEOUT)
+        except Exception as exc:
+            self.state.add_log("web", f"Failed to load memory run: {exc}")
             self.send_json(
                 {"ok": False, "error": str(exc)},
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1739,6 +1840,31 @@ INDEX_HTML = r"""<!doctype html>
       currentMemoryRun = select.value;
     }
 
+    async function ensureSelectedRunForGo() {
+      if (!currentMemoryRun || currentMemoryRun === "qdrant") return true;
+      const goButton = $("go");
+      const oldText = goButton.textContent;
+      goButton.disabled = true;
+      goButton.textContent = "Load DB";
+      try {
+        const res = await fetch("/api/memory/load-run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run: currentMemoryRun })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          console.warn(data.error || "Failed to load selected run");
+          return false;
+        }
+        currentMemoryRun = "qdrant";
+        await loadMemory();
+        return true;
+      } finally {
+        goButton.textContent = oldText;
+      }
+    }
+
     function renderMemory(data) {
       const items = data.items || [];
       const grid = $("memoryGrid");
@@ -1845,6 +1971,11 @@ INDEX_HTML = r"""<!doctype html>
     async function navigate() {
       const query = $("query").value.trim();
       if (!query) return;
+      const ready = await ensureSelectedRunForGo();
+      if (!ready) {
+        refreshStatus();
+        return;
+      }
       previewSemanticMatch(query);
       const res = await fetch("/api/navigate", {
         method: "POST",
@@ -1942,6 +2073,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qdrant-timeout-sec", type=float, default=2.0)
     parser.add_argument("--memory-limit", type=int, default=200)
     parser.add_argument("--memory-search-timeout-sec", type=float, default=45.0)
+    parser.add_argument("--memory-load-timeout-sec", type=float, default=600.0)
     parser.add_argument("--stream-width", type=int, default=640)
     parser.add_argument("--jpeg-quality", type=int, default=70)
     parser.add_argument("--max-stream-fps", type=float, default=3.0)

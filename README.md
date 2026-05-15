@@ -34,8 +34,10 @@ From the web panel:
 The `Memory DB` tab shows keyframes from exploration runs, including image, pose
 frame, coordinates, score when available, topics, and file path. The newest
 `data/exploration_runs/run_*` folder is selected by default, and the tab also
-shows which run is currently loaded into Qdrant. When `Go` is pressed, the panel
-shows the image selected by semantic search for that text query.
+shows which run is currently loaded into Qdrant. When `Go` is pressed with a
+file-based run selected, the panel first loads that run into Qdrant, computing
+missing embeddings when needed, then navigates using that selected run. The panel
+also shows the image selected by semantic search for the text query.
 
 ## Stop Runtime Processes
 
