@@ -26,7 +26,8 @@ log/
 
 # Generated semantic-memory data
 data/keyframes/
-data/exploration_runs/
+data/recordings/
+data/maps/
 
 # Local logs and scratch files
 *.log

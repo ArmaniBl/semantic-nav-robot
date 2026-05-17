@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import re
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -10,9 +11,12 @@ import cv2
 import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 def stamp_to_sec(msg) -> float:
@@ -27,6 +31,57 @@ def yaw_from_quaternion(q) -> float:
 
 def shortest_angle_delta(a: float, b: float) -> float:
     return math.atan2(math.sin(a - b), math.cos(a - b))
+
+
+def quaternion_multiply(left: tuple[float, float, float, float], right: tuple[float, float, float, float]):
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def normalize_quaternion(quaternion: tuple[float, float, float, float]):
+    x, y, z, w = quaternion
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if not math.isfinite(norm) or norm <= 1e-6:
+        raise ValueError("invalid quaternion")
+    return x / norm, y / norm, z / norm, w / norm
+
+
+def rotate_vector(vector: tuple[float, float, float], quaternion: tuple[float, float, float, float]):
+    q_conjugate = (-quaternion[0], -quaternion[1], -quaternion[2], quaternion[3])
+    rotated = quaternion_multiply(
+        quaternion_multiply(quaternion, (vector[0], vector[1], vector[2], 0.0)),
+        q_conjugate,
+    )
+    return rotated[:3]
+
+
+def transform_pose(position, orientation, transform):
+    t = transform.transform.translation
+    r = transform.transform.rotation
+    transform_quat = normalize_quaternion((r.x, r.y, r.z, r.w))
+    pose_quat = normalize_quaternion((orientation.x, orientation.y, orientation.z, orientation.w))
+
+    rotated_position = rotate_vector((position.x, position.y, position.z), transform_quat)
+    out_quat = normalize_quaternion(quaternion_multiply(transform_quat, pose_quat))
+    return (
+        {
+            "x": rotated_position[0] + t.x,
+            "y": rotated_position[1] + t.y,
+            "z": rotated_position[2] + t.z,
+        },
+        {
+            "x": out_quat[0],
+            "y": out_quat[1],
+            "z": out_quat[2],
+            "w": out_quat[3],
+        },
+    )
 
 
 def image_msg_to_bgr(msg: Image) -> np.ndarray:
@@ -79,6 +134,10 @@ class KeyframeRecorder(Node):
         self.min_translation_delta_m = args.min_translation_delta_m
         self.min_rotation_delta_rad = args.min_rotation_delta_rad
         self.max_pose_age_sec = args.max_pose_age_sec
+        self.target_frame = args.target_frame.strip()
+        self.tf_timeout_sec = args.tf_timeout_sec
+        self.allow_latest_tf_fallback = args.allow_latest_tf_fallback
+        self.warned_latest_tf_fallback = False
 
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -101,8 +160,11 @@ class KeyframeRecorder(Node):
 
         self.create_subscription(Image, self.image_topic, self.on_image, sensor_qos)
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, odom_qos)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
         self.get_logger().info(
             f"Recording keyframes: image={self.image_topic}, odom={self.odom_topic}, "
+            f"target_frame={self.target_frame or '<odom header>'}, "
             f"output={self.output_dir}, next_index={self.saved_count + 1}"
         )
 
@@ -130,6 +192,48 @@ class KeyframeRecorder(Node):
             or rotation >= self.min_rotation_delta_rad
         )
 
+    def recorded_pose(self, odom: Odometry) -> tuple[str, dict, dict]:
+        source_frame = odom.header.frame_id
+        if not source_frame:
+            raise ValueError("Odometry header.frame_id is empty")
+
+        p = odom.pose.pose.position
+        q = odom.pose.pose.orientation
+        target_frame = self.target_frame or source_frame
+        if target_frame == source_frame:
+            qx, qy, qz, qw = normalize_quaternion((q.x, q.y, q.z, q.w))
+            return (
+                source_frame,
+                {"x": p.x, "y": p.y, "z": p.z},
+                {"x": qx, "y": qy, "z": qz, "w": qw},
+            )
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                rclpy.time.Time.from_msg(odom.header.stamp),
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+        except TransformException:
+            if not self.allow_latest_tf_fallback:
+                raise
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+            if not self.warned_latest_tf_fallback:
+                self.get_logger().warn(
+                    f"Using latest TF {target_frame}->{source_frame} for keyframe pose "
+                    "because timestamped TF was unavailable"
+                )
+                self.warned_latest_tf_fallback = True
+
+        position, orientation = transform_pose(p, q, transform)
+        return transform.header.frame_id, position, orientation
+
     def on_image(self, msg: Image) -> None:
         if self.latest_odom is None:
             self.get_logger().warn("Image received, but odometry is not available yet")
@@ -146,6 +250,13 @@ class KeyframeRecorder(Node):
             return
 
         if not self.should_save(image_time, self.latest_odom):
+            return
+
+        odom = self.latest_odom
+        try:
+            pose_frame, position, orientation = self.recorded_pose(odom)
+        except (ValueError, TransformException) as exc:
+            self.get_logger().warn(f"Skipping image: failed to resolve keyframe pose: {exc}")
             return
 
         try:
@@ -166,9 +277,6 @@ class KeyframeRecorder(Node):
             self.get_logger().error(f"Failed to save image: {image_path}")
             return
 
-        odom = self.latest_odom
-        p = odom.pose.pose.position
-        q = odom.pose.pose.orientation
         record = {
             "memory_id": frame_id,
             "timestamp": image_time,
@@ -176,13 +284,11 @@ class KeyframeRecorder(Node):
             "image_topic": self.image_topic,
             "image_frame": msg.header.frame_id,
             "pose_topic": self.odom_topic,
-            "pose_frame": odom.header.frame_id,
+            "pose_frame": pose_frame,
             "child_frame_id": odom.child_frame_id,
             "pose_age_sec": pose_age,
-            "pose": {
-                "position": {"x": p.x, "y": p.y, "z": p.z},
-                "orientation": {"x": q.x, "y": q.y, "z": q.z, "w": q.w},
-            },
+            "pose": {"position": position, "orientation": orientation},
+            "source_pose_frame": odom.header.frame_id,
             "status": "active",
         }
         with self.metadata_path.open("a", encoding="utf-8") as file:
@@ -191,9 +297,24 @@ class KeyframeRecorder(Node):
         self.last_saved_odom = odom
         self.last_saved_time = image_time
         self.get_logger().info(
-            f"Saved {frame_id}: pose_frame={odom.header.frame_id}, "
+            f"Saved {frame_id}: pose_frame={pose_frame}, source_frame={odom.header.frame_id}, "
             f"image_frame={msg.header.frame_id}, pose_age={pose_age:.3f}s"
         )
+
+    def close(self) -> None:
+        try:
+            self.tf_listener.unregister()
+        except Exception:
+            pass
+        executor = getattr(self.tf_listener, "executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown()
+            except Exception:
+                pass
+        thread = getattr(self.tf_listener, "dedicated_listener_thread", None)
+        if thread is not None:
+            thread.join(timeout=1.0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,18 +338,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-translation-delta-m", type=float, default=0.25)
     parser.add_argument("--min-rotation-delta-rad", type=float, default=0.25)
     parser.add_argument("--max-pose-age-sec", type=float, default=0.25)
+    parser.add_argument(
+        "--target-frame",
+        default="",
+        help="Frame to store keyframe poses in. Empty keeps odometry header.frame_id.",
+    )
+    parser.add_argument("--tf-timeout-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--allow-latest-tf-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the latest target-frame transform if timestamped TF is unavailable.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    default_excepthook = threading.excepthook
+
+    def recorder_excepthook(args) -> None:
+        if args.exc_type is ExternalShutdownException:
+            return
+        default_excepthook(args)
+
+    threading.excepthook = recorder_excepthook
+
     args = parse_args()
     rclpy.init()
     node = KeyframeRecorder(args)
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
