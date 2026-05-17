@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import sys
 from pathlib import Path
 
 from launch import LaunchDescription
@@ -15,6 +16,7 @@ from launch.events import matches_action
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import LifecycleNode, Node, SetParameter
 from launch_ros.event_handlers import OnStateTransition
+from launch.event_handlers import OnProcessExit
 from launch_ros.events.lifecycle import ChangeState
 from lifecycle_msgs.msg import Transition
 
@@ -43,10 +45,6 @@ def generate_launch_description():
     scan_angle_min = LaunchConfiguration("scan_angle_min")
     scan_angle_max = LaunchConfiguration("scan_angle_max")
     scan_range_max = LaunchConfiguration("scan_range_max")
-    run_explorer = LaunchConfiguration("run_explorer")
-    explorer_max_goal_distance = LaunchConfiguration("explorer_max_goal_distance")
-    explorer_min_frontier_size = LaunchConfiguration("explorer_min_frontier_size")
-    explorer_goal_timeout_sec = LaunchConfiguration("explorer_goal_timeout_sec")
 
     remappings = [
         ("/tf", "tf"),
@@ -69,6 +67,70 @@ def generate_launch_description():
         ],
         arguments=["--ros-args", "--log-level", log_level],
     )
+
+    nav2_waiter = ExecuteProcess(
+        cmd=[
+            sys.executable,
+            str(PROJECT_ROOT / "wait_for_slam_ready.py"),
+            "--map-topic",
+            "/map",
+            "--scan-topic",
+            "/scan",
+            "--target-frame",
+            "map",
+            "--source-frame",
+            "base_link",
+        ],
+        cwd=str(PROJECT_ROOT),
+        output="screen",
+    )
+
+    nav2_nodes = [
+        Node(
+            package="nav2_controller",
+            executable="controller_server",
+            name="controller_server",
+            output="screen",
+            parameters=[nav2_params_file],
+            arguments=["--ros-args", "--log-level", log_level],
+            remappings=remappings,
+        ),
+        Node(
+            package="nav2_planner",
+            executable="planner_server",
+            name="planner_server",
+            output="screen",
+            parameters=[nav2_params_file],
+            arguments=["--ros-args", "--log-level", log_level],
+            remappings=remappings,
+        ),
+        Node(
+            package="nav2_behaviors",
+            executable="behavior_server",
+            name="behavior_server",
+            output="screen",
+            parameters=[nav2_params_file],
+            arguments=["--ros-args", "--log-level", log_level],
+            remappings=remappings,
+        ),
+        Node(
+            package="nav2_bt_navigator",
+            executable="bt_navigator",
+            name="bt_navigator",
+            output="screen",
+            parameters=[nav2_params_file],
+            arguments=["--ros-args", "--log-level", log_level],
+            remappings=remappings,
+        ),
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_navigation",
+            output="screen",
+            parameters=[nav2_params_file],
+            arguments=["--ros-args", "--log-level", log_level],
+        ),
+    ]
 
     return LaunchDescription(
         [
@@ -97,14 +159,6 @@ def generate_launch_description():
             DeclareLaunchArgument("scan_angle_min", default_value="-3.14159"),
             DeclareLaunchArgument("scan_angle_max", default_value="3.14159"),
             DeclareLaunchArgument("scan_range_max", default_value="10.0"),
-            DeclareLaunchArgument(
-                "run_explorer",
-                default_value="false",
-                description="Start the local frontier_explorer.py client after Nav2 bringup.",
-            ),
-            DeclareLaunchArgument("explorer_max_goal_distance", default_value="4.0"),
-            DeclareLaunchArgument("explorer_min_frontier_size", default_value="8"),
-            DeclareLaunchArgument("explorer_goal_timeout_sec", default_value="90.0"),
             SetParameter("use_sim_time", use_sim_time),
             Node(
                 package="tf2_ros",
@@ -180,62 +234,15 @@ def generate_launch_description():
                     ],
                 )
             ),
-            Node(
-                package="nav2_controller",
-                executable="controller_server",
-                name="controller_server",
-                output="screen",
-                parameters=[nav2_params_file],
-                arguments=["--ros-args", "--log-level", log_level],
-                remappings=remappings,
-            ),
-            Node(
-                package="nav2_planner",
-                executable="planner_server",
-                name="planner_server",
-                output="screen",
-                parameters=[nav2_params_file],
-                arguments=["--ros-args", "--log-level", log_level],
-                remappings=remappings,
-            ),
-            Node(
-                package="nav2_behaviors",
-                executable="behavior_server",
-                name="behavior_server",
-                output="screen",
-                parameters=[nav2_params_file],
-                arguments=["--ros-args", "--log-level", log_level],
-                remappings=remappings,
-            ),
-            Node(
-                package="nav2_bt_navigator",
-                executable="bt_navigator",
-                name="bt_navigator",
-                output="screen",
-                parameters=[nav2_params_file],
-                arguments=["--ros-args", "--log-level", log_level],
-                remappings=remappings,
-            ),
-            Node(
-                package="nav2_lifecycle_manager",
-                executable="lifecycle_manager",
-                name="lifecycle_manager_navigation",
-                output="screen",
-                parameters=[nav2_params_file],
-                arguments=["--ros-args", "--log-level", log_level],
-            ),
-            ExecuteProcess(
-                cmd=[
-                    str(PROJECT_ROOT / "frontier_explorer.py"),
-                    "--max-goal-distance",
-                    explorer_max_goal_distance,
-                    "--min-frontier-size",
-                    explorer_min_frontier_size,
-                    "--goal-timeout-sec",
-                    explorer_goal_timeout_sec,
-                ],
-                output="screen",
-                condition=IfCondition(run_explorer),
+            nav2_waiter,
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=nav2_waiter,
+                    on_exit=[
+                        LogInfo(msg="[LifecycleLaunch] SLAM ready gate passed; starting Nav2"),
+                        *nav2_nodes,
+                    ],
+                )
             ),
         ]
     )

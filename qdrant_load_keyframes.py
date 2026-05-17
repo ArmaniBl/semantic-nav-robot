@@ -77,7 +77,7 @@ def ensure_collection(
 
 
 def create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
-    for field in ("memory_id", "status", "embedding_model", "pose_frame"):
+    for field in ("memory_id", "run_id", "status", "embedding_model", "pose_frame", "map_yaml"):
         client.create_payload_index(
             collection_name=collection_name,
             field_name=field,
