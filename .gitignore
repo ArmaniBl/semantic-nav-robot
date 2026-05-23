@@ -28,7 +28,6 @@ logs/
 # Generated semantic-memory data
 data/keyframes/
 data/recordings/
-data/maps/
 data/runtime_state.json
 
 # Local logs and scratch files
