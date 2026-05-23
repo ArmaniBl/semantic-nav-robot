@@ -1,38 +1,41 @@
-# Semantic Navigation Robot Control
+# Robot Navigation Control
 
-Проект для семантической навигации робота в ROS 2 Jazzy / Isaac Sim.
+Проект для управления мобильным роботом в ROS 2 Jazzy / Isaac Sim.
 
-Система строит SLAM-карту, записывает визуальные keyframes с позой робота,
-считает RuCLIP-эмбеддинги, загружает их в Qdrant и затем позволяет ехать по
-текстовому запросу: например `pumpkin`, `door`, `boxes`, `дорога`.
+Система записывает визуальные keyframes с позой робота, загружает записи в
+Qdrant и позволяет отправлять робота к сохраненной позе наблюдения по
+текстовому запросу.
 
 ## Что Умеет
 
 - Показывает live camera stream в локальной web-панели.
 - Запускает и останавливает Qdrant.
-- Запускает и останавливает SLAM Toolbox + Nav2.
-- Записывает semantic memory через `Start DB recording` / `Stop DB recording`.
-- После записи автоматически считает RuCLIP embeddings и загружает их в Qdrant.
-- Ищет похожие visual keyframes по тексту.
+- Запускает и останавливает Nav2 в `odom`-frame профиле.
+- Записывает keyframes через `Start DB recording` / `Stop DB recording`.
+- Загружает записи в Qdrant collection.
+- Ищет похожие keyframes по текстовому запросу.
 - Отправляет Nav2 цель в координатах найденного keyframe.
-- Пока робот едет к координатам, проверяет live-camera RuCLIP score; если текущий кадр совпал с запросом, goal отменяется и миссия считается выполненной.
+- Проверяет live camera во время движения и после прибытия.
+- После прибытия к цели поворачивает робота на месте до 360 градусов.
+- Если совпадение найдено во время поворота, робот сразу останавливается.
 - Управляет Qdrant collections из UI.
 
-## Важная Модель Координат
+## Текущая Схема Координат
 
-`map` в SLAM не является абсолютной мировой системой Isaac Sim.
+Основной runtime работает в `odom`.
 
-При новом запуске SLAM координаты `map` строятся заново. Поэтому visual memory,
-записанная в одном SLAM-сеансе, может вести робота не туда в другом SLAM-сеансе.
+Запись сохраняет pose keyframe в `odom`, и `Go` отправляет цель в тот же frame.
+Это снижает риск смешивания старой `map` с текущим запуском симуляции.
 
 Практическое правило:
 
 1. Запусти симуляцию.
-2. Запусти SLAM/Nav2.
+2. Запусти `Start Map/Nav2`.
 3. Запиши DB recording.
-4. Используй именно collection, созданную в этом же SLAM-сеансе.
+4. Используй collection, созданную для текущего запуска.
 
-Если симуляция или SLAM были перезапущены, лучше записать новую DB.
+Если симуляция была перезапущена, лучше сделать новую запись или убедиться, что
+робот стартовал в той же позе относительно сохраненной системы координат.
 
 ## Структура
 
@@ -40,21 +43,20 @@
 web_control_panel.py          Web UI и HTTP API управления runtime
 semantic_nav_to_pose.py       Поиск Qdrant по тексту и отправка Nav2 goal
 ros_keyframe_recorder.py      Запись RGB keyframes + pose metadata
-ruclip_embed_keyframes.py     Расчет RuCLIP image embeddings
-qdrant_load_keyframes.py      Загрузка embeddings в Qdrant
-semantic_search_qdrant.py     CLI semantic search по Qdrant
-semantic_search_offline.py    Offline search по локальным embeddings
-obstacle_right_turn.py        Простой тестовый reactive controller: ехать/повернуть
+qdrant_load_keyframes.py      Загрузка записей в Qdrant
+semantic_search_qdrant.py     CLI-поиск по Qdrant
+semantic_search_offline.py    Offline-поиск по локальным данным
 wait_for_slam_ready.py        Gate перед запуском Nav2: ждет /clock, /scan, /map, TF
-restart_semantic_nav.sh       Полный restart web + Qdrant + SLAM/Nav2
+restart_semantic_nav.sh       Полный restart web + Qdrant + Nav2
 stop_all.sh                   Остановка runtime-процессов
 
-launch/slam_nav2_launch.py    SLAM Toolbox + pointcloud_to_laserscan + gated Nav2
 launch/nav2_odom_launch.py    Nav2 в odom-frame профиле
+launch/slam_nav2_launch.py    SLAM Toolbox + pointcloud_to_laserscan + gated Nav2
+launch/localization_nav2_launch.py Saved map + AMCL localization + gated Nav2
 
-config/slam_toolbox_params.yaml
-config/nav2_slam_params.yaml
 config/nav2_odom_params.yaml
+config/nav2_slam_params.yaml
+config/nav2_localization_params.yaml
 compose.qdrant.yml
 ```
 
@@ -69,13 +71,7 @@ compose.qdrant.yml
 - Docker Compose для Qdrant.
 - Python окружение проекта:
   - системный `python3` с ROS пакетами для web/recorder/launch helper;
-  - `.ruclip_venv` для RuCLIP/Qdrant semantic scripts.
-
-Модель RuCLIP кэшируется в:
-
-```text
-.cache/ruclip/
-```
+  - локальное окружение для Qdrant и обработки записей.
 
 Runtime данные Qdrant хранятся в:
 
@@ -83,7 +79,7 @@ Runtime данные Qdrant хранятся в:
 qdrant_storage/
 ```
 
-Эти директории не коммитятся.
+Эта директория не коммитится.
 
 ## Быстрый Старт
 
@@ -118,10 +114,10 @@ http://<VM-IP>:8765/
 1. Запусти Isaac Sim и дождись публикации `/clock`.
 2. Открой web-панель.
 3. Убедись, что Qdrant `ready`.
-4. Нажми `Start SLAM/Nav2`.
-5. Дождись `SLAM/Nav2 ready`.
+4. Нажми `Start Map/Nav2`.
+5. Дождись готовности Nav2.
 6. Нажми `Start DB recording`.
-7. Провези или поставь робота в местах, которые нужны для semantic memory.
+7. Провези или поставь робота в местах, которые нужны для базы наблюдений.
 8. Нажми `Stop DB recording`.
 9. Дождись загрузки записи в Qdrant.
 10. Введи текстовый запрос.
@@ -139,78 +135,69 @@ data/recordings/run_YYYYMMDD_HHMMSS/keyframes/
 semantic_visual_memory_run_YYYYMMDD_HHMMSS
 ```
 
+Последняя выбранная collection сохраняется локально в:
+
+```text
+data/runtime_state.json
+```
+
 ## Как Работает `Go`
 
 `semantic_nav_to_pose.py` выполняет один mission run:
 
-1. Кодирует текстовый запрос RuCLIP text encoder.
-2. Ищет top-k похожих image embeddings в выбранной Qdrant collection.
-3. Берет первый semantic candidate.
+1. Принимает текстовый запрос.
+2. Ищет top-k похожих keyframes в выбранной Qdrant collection.
+3. Берет первый подходящий candidate.
 4. Достает сохраненную pose из payload.
-5. Преобразует pose в `goal_frame`, обычно `map`.
-6. Отправляет точные координаты в Nav2 action `/navigate_to_pose`.
-7. Пока Nav2 едет, периодически проверяет live camera:
-   - кадр кодируется RuCLIP image encoder;
-   - считается similarity с исходным текстом;
-   - если score >= `--mission-match-threshold`, Nav2 goal отменяется и миссия считается успешной.
-8. Если Nav2 доехал до goal, миссия считается успешной.
-9. Если выбранный goal не сработал, по умолчанию mission run завершается ошибкой и не прыгает на другие keyframes.
+5. Отправляет pose в `goal_frame`, обычно `odom`.
+6. Отправляет координаты в Nav2 action `/navigate_to_pose`.
+7. Пока Nav2 едет, периодически проверяет live camera.
+8. Порог совпадения зависит от количества слов в запросе:
+   - 1 слово = `0.25`;
+   - 2 слова = `0.26`;
+   - дальше порог растет медленнее;
+   - максимум = `0.8`.
+9. Если совпадение найдено во время движения, Nav2 goal отменяется и робот останавливается.
+10. Если Nav2 доехал до goal, робот поворачивается на месте до 360 градусов.
+11. Поворот контролируется по TF yaw, а не только по таймеру.
+12. Если совпадение найдено во время поворота, робот сразу останавливается.
+13. Если совпадения нет, пробуется следующий candidate, максимум 3 попытки.
 
-Это важно: один `Go` теперь означает одну выбранную цель, без автоматического переключения на следующий semantic candidate.
-
-Для возврата старого поведения можно вручную запускать:
-
-```bash
-./.ruclip_venv/bin/python semantic_nav_to_pose.py "pumpkin" --try-next-candidates
-```
-
-## Параметры Semantic Mission
+## Параметры Mission
 
 Основные параметры `semantic_nav_to_pose.py`:
 
 ```bash
---collection                      Qdrant collection
---top-k                           сколько кандидатов запросить из Qdrant
---goal-frame                      frame для Nav2 goal, по умолчанию map
---image-topic                     live camera topic
---complete-on-visual-match        завершать миссию при совпадении live camera
---mission-match-threshold         порог совпадения, по умолчанию 0.30
---mission-check-period-sec        период проверки live camera, по умолчанию 1.5
---max-goal-distance               0 = ехать к точным координатам
---try-next-candidates             пробовать следующие keyframes при ошибке Nav2
+--collection                       Qdrant collection
+--top-k                            сколько кандидатов запросить из Qdrant
+--goal-frame                       frame для Nav2 goal, по умолчанию odom
+--image-topic                      live camera topic
+--complete-on-visual-match         завершать миссию при совпадении live camera
+--mission-check-period-sec         период проверки live camera, по умолчанию 1.5
+--arrival-spin-angle-deg           угол поворота после прибытия, по умолчанию 360
+--arrival-spin-angular-vel-rad-sec скорость поворота после прибытия, по умолчанию 0.45
+--max-goal-distance                0 = ехать к точным координатам
+--max-candidate-attempts           максимум candidates за один Go, по умолчанию 3
 ```
 
-Web-панель запускает semantic navigation через `.ruclip_venv/bin/python`.
+Параметр `--mission-match-threshold` оставлен только для совместимости старых
+команд. Фактический порог рассчитывается автоматически по текстовому запросу.
 
-## SLAM/Nav2 Bringup
+## Nav2
 
-`launch/slam_nav2_launch.py` запускает:
+Основной режим web-панели запускает `launch/nav2_odom_launch.py`.
 
-1. `static_transform_publisher` для `base_link -> front_3d_lidar`;
-2. `pointcloud_to_laserscan`, который делает `/scan` из `/front_3d_lidar/lidar_points`;
-3. `slam_toolbox`;
-4. `wait_for_slam_ready.py`;
-5. Nav2 nodes только после готовности SLAM.
+Этот профиль:
 
-`wait_for_slam_ready.py` ждет:
+- использует `odom` как рабочий frame для целей;
+- ждет `/clock`, `/scan` и нужный TF;
+- использует спокойные параметры движения;
+- слушает `/scan` для остановки перед близким препятствием.
 
-- `/clock` publisher;
-- `/scan` publisher;
-- `/map` publisher;
-- TF `map -> base_link`.
+Дополнительные launch-файлы оставлены для ручных проверок:
 
-Это предотвращает ранний старт Nav2, когда `map` еще не существует.
-
-## Nav2 Профиль
-
-В `config/nav2_slam_params.yaml` включен спокойный профиль движения:
-
-- сниженная линейная скорость;
-- увеличенный lookahead;
-- отключен velocity-scaled lookahead;
-- уменьшено угловое ускорение;
-- увеличен `bond_timeout`, чтобы lifecycle manager не гасил Nav2 из-за короткой просадки heartbeat;
-- global costmap сделана большой rolling window, чтобы planner мог принимать дальние точные координаты.
+- `launch/slam_nav2_launch.py`;
+- `launch/localization_nav2_launch.py`.
 
 ## Recording Pipeline
 
@@ -224,16 +211,14 @@ Recorder:
 
 - слушает RGB image topic;
 - слушает odometry;
-- получает pose в target frame, обычно `map`;
+- получает pose в target frame, обычно `odom`;
 - сохраняет PNG keyframes;
 - пишет `metadata.jsonl`.
 
-После `Stop DB recording` web-панель запускает:
-
-```bash
-.ruclip_venv/bin/python ruclip_embed_keyframes.py ...
-.ruclip_venv/bin/python qdrant_load_keyframes.py ...
-```
+После остановки записи web-панель проверяет непрерывность траектории в выбранном
+`goal_frame`. Если между соседними keyframes обнаружен скачок больше
+`--record-max-map-step-m` (по умолчанию `5.0 m`), запись не загружается в
+Qdrant.
 
 В Qdrant payload сохраняются:
 
@@ -242,7 +227,7 @@ Recorder:
 - image path/topic/frame
 - pose frame/source frame
 - pose position/orientation
-- embedding model
+- map_yaml/map_image
 - status
 
 ## Qdrant
@@ -287,35 +272,23 @@ source /opt/ros/jazzy/setup.bash
 python3 web_control_panel.py --host 127.0.0.1 --port 8765
 ```
 
-## Reactive Obstacle Test
+Логи web-интерфейса пишутся в:
 
-`obstacle_right_turn.py` — отдельный простой тестовый скрипт, не часть semantic mission.
-
-Поведение:
-
-- ждет `/scan`;
-- едет вперед;
-- если видит препятствие ближе `--stop-distance-m`, поворачивает вправо на `--turn-angle-deg`, по умолчанию 90 градусов;
-- если скан протух, останавливается.
-
-Пример:
-
-```bash
-source /opt/ros/jazzy/setup.bash
-./obstacle_right_turn.py --stop-distance-m 2.0 --linear-speed 0.25 --angular-speed 0.4
+```text
+logs/web/process.log
+logs/web/events_YYYYMMDD_HHMMSS.log
 ```
 
 ## Важные Правила Эксплуатации
 
-### Не перезапускать симуляцию под живым SLAM/Nav2
+### Не перезапускать симуляцию под живым Nav2
 
-Если перезапустить Isaac Sim, пока SLAM/Nav2 работают:
+Если перезапустить Isaac Sim, пока runtime работает:
 
 - `/clock` сбросится или пропадет;
 - TF-buffer останется со старым временем;
 - могут появиться `Extrapolation Error`;
-- `map -> base_link` может стать неконсистентным;
-- старые keyframes могут перестать соответствовать текущей карте.
+- старые keyframes могут перестать соответствовать текущей позе робота.
 
 Правильный порядок:
 
@@ -325,10 +298,11 @@ source /opt/ros/jazzy/setup.bash
 ./restart_semantic_nav.sh
 ```
 
-### Не смешивать collections между SLAM-сеансами
+### Не смешивать старые collections без проверки
 
-Если SLAM был перезапущен, новая `map` может иметь другой ноль и поворот.
-Используй collection, записанную после текущего запуска SLAM.
+Если симуляция или одометрия стартовали иначе, старая collection может вести
+робота не туда. Для стабильного теста используй collection, записанную в том же
+сеансе.
 
 ## Troubleshooting
 
@@ -344,9 +318,8 @@ curl -fsS http://127.0.0.1:8765/api/status | python3 -m json.tool
 
 - Qdrant ready;
 - `/clock` публикуется;
-- `/map` публикуется;
 - `/navigate_to_pose` доступен;
-- TF `map -> base_link` доступен;
+- TF `goal_frame -> base_link` доступен;
 - нет активной записи DB;
 - нет активной navigation mission.
 
@@ -358,26 +331,29 @@ curl -fsS http://127.0.0.1:8765/api/status | python3 -m json.tool
 source /opt/ros/jazzy/setup.bash
 ```
 
-### `GOAL_OUTSIDE_MAP`
+### Робот врезается при движении к цели
 
-Nav2 planner считает, что цель вне global costmap. В текущем профиле global costmap 80x80 rolling window. Если цель дальше, нужно:
+Runtime слушает `/scan`. Если впереди в секторе 70 градусов есть препятствие
+ближе `0.85 m`, mission отменяет Nav2 goal и публикует ноль в `/cmd_vel`.
 
-- записать актуальную DB ближе к текущему SLAM-сеансу;
-- или увеличить global costmap;
-- или включить `--max-goal-distance`, если нужна промежуточная цель.
+Порог можно изменить при запуске web-панели:
+
+```bash
+python3 web_control_panel.py --front-obstacle-stop-distance-m 1.0
+```
 
 ### Робот едет визуально не туда
 
 Проверь:
 
-- выбрана ли collection текущего SLAM-сеанса;
+- выбрана ли правильная collection;
 - не перезапускалась ли симуляция после записи DB;
 - какие координаты отправлены в log строке `Sending keyframe...`;
 - текущий TF:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-ros2 run tf2_ros tf2_echo map base_link
+ros2 run tf2_ros tf2_echo odom base_link
 ```
 
 ### Робот виляет
@@ -385,11 +361,11 @@ ros2 run tf2_ros tf2_echo map base_link
 Параметры движения находятся в:
 
 ```text
-config/nav2_slam_params.yaml
 config/nav2_odom_params.yaml
+config/nav2_slam_params.yaml
 ```
 
-Уже выставлен спокойный профиль. Если все еще виляет, можно снизить:
+Если все еще виляет, можно снизить:
 
 ```yaml
 desired_linear_vel: 0.08
@@ -401,20 +377,19 @@ desired_linear_vel: 0.08
 python3 -m py_compile \
   web_control_panel.py \
   ros_keyframe_recorder.py \
-  ruclip_embed_keyframes.py \
   qdrant_load_keyframes.py \
   semantic_nav_to_pose.py \
   semantic_search_qdrant.py \
   semantic_search_offline.py \
-  obstacle_right_turn.py \
   wait_for_slam_ready.py \
   launch/slam_nav2_launch.py \
+  launch/localization_nav2_launch.py \
   launch/nav2_odom_launch.py
 
 bash -n restart_semantic_nav.sh stop_all.sh
 
 source /opt/ros/jazzy/setup.bash
-ros2 launch launch/slam_nav2_launch.py --show-args
+ros2 launch launch/nav2_odom_launch.py --show-args
 ```
 
 ## Git Hygiene
@@ -422,9 +397,10 @@ ros2 launch launch/slam_nav2_launch.py --show-args
 Не коммитятся:
 
 - виртуальные окружения;
-- RuCLIP model cache;
 - Qdrant storage;
-- recordings/keyframes/embeddings;
+- recordings/keyframes;
+- local map files in `data/maps/`;
+- local runtime state in `data/runtime_state.json`;
 - Python/ROS build caches;
 - local logs.
 

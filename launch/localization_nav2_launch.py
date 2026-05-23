@@ -3,32 +3,20 @@ import sys
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    EmitEvent,
-    ExecuteProcess,
-    LogInfo,
-    RegisterEventHandler,
-    SetEnvironmentVariable,
-)
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, RegisterEventHandler, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
-from launch.events import matches_action
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import LifecycleNode, Node, SetParameter
-from launch_ros.event_handlers import OnStateTransition
 from launch.event_handlers import OnProcessExit
-from launch_ros.events.lifecycle import ChangeState
-from lifecycle_msgs.msg import Transition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node, SetParameter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_NAV2_PARAMS = PROJECT_ROOT / "config" / "nav2_slam_params.yaml"
-DEFAULT_SLAM_PARAMS = PROJECT_ROOT / "config" / "slam_toolbox_params.yaml"
+DEFAULT_PARAMS = PROJECT_ROOT / "config" / "nav2_localization_params.yaml"
 
 
 def generate_launch_description():
-    nav2_params_file = LaunchConfiguration("nav2_params_file")
-    slam_params_file = LaunchConfiguration("slam_params_file")
+    params_file = LaunchConfiguration("params_file")
+    map_yaml = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
     log_level = LaunchConfiguration("log_level")
 
@@ -45,6 +33,9 @@ def generate_launch_description():
     scan_angle_min = LaunchConfiguration("scan_angle_min")
     scan_angle_max = LaunchConfiguration("scan_angle_max")
     scan_range_max = LaunchConfiguration("scan_range_max")
+    initial_pose_x = LaunchConfiguration("initial_pose_x")
+    initial_pose_y = LaunchConfiguration("initial_pose_y")
+    initial_pose_yaw = LaunchConfiguration("initial_pose_yaw")
 
     remappings = [
         ("/tf", "tf"),
@@ -52,23 +43,7 @@ def generate_launch_description():
         ("cmd_vel", "/cmd_vel"),
     ]
 
-    slam_toolbox_node = LifecycleNode(
-        package="slam_toolbox",
-        executable="async_slam_toolbox_node",
-        name="slam_toolbox",
-        namespace="",
-        output="screen",
-        parameters=[
-            slam_params_file,
-            {
-                "use_sim_time": use_sim_time,
-                "use_lifecycle_manager": False,
-            },
-        ],
-        arguments=["--ros-args", "--log-level", log_level],
-    )
-
-    nav2_waiter = ExecuteProcess(
+    nav2_ready_waiter = ExecuteProcess(
         cmd=[
             sys.executable,
             str(PROJECT_ROOT / "wait_for_slam_ready.py"),
@@ -91,7 +66,7 @@ def generate_launch_description():
             executable="controller_server",
             name="controller_server",
             output="screen",
-            parameters=[nav2_params_file],
+            parameters=[params_file],
             arguments=["--ros-args", "--log-level", log_level],
             remappings=remappings,
         ),
@@ -100,7 +75,7 @@ def generate_launch_description():
             executable="planner_server",
             name="planner_server",
             output="screen",
-            parameters=[nav2_params_file],
+            parameters=[params_file],
             arguments=["--ros-args", "--log-level", log_level],
             remappings=remappings,
         ),
@@ -109,7 +84,7 @@ def generate_launch_description():
             executable="behavior_server",
             name="behavior_server",
             output="screen",
-            parameters=[nav2_params_file],
+            parameters=[params_file],
             arguments=["--ros-args", "--log-level", log_level],
             remappings=remappings,
         ),
@@ -118,33 +93,48 @@ def generate_launch_description():
             executable="bt_navigator",
             name="bt_navigator",
             output="screen",
-            parameters=[nav2_params_file],
+            parameters=[params_file],
             arguments=["--ros-args", "--log-level", log_level],
             remappings=remappings,
         ),
-        Node(
-            package="nav2_lifecycle_manager",
-            executable="lifecycle_manager",
-            name="lifecycle_manager_navigation",
-            output="screen",
-            parameters=[nav2_params_file],
-            arguments=["--ros-args", "--log-level", log_level],
-        ),
     ]
+
+    nav2_activator = ExecuteProcess(
+        cmd=[
+            sys.executable,
+            str(PROJECT_ROOT / "activate_nav2_lifecycle.py"),
+            "--start-delay-sec",
+            "1.0",
+        ],
+        cwd=str(PROJECT_ROOT),
+        output="screen",
+    )
+
+    initial_pose_publisher = ExecuteProcess(
+        cmd=[
+            sys.executable,
+            str(PROJECT_ROOT / "publish_initial_pose.py"),
+            "--x",
+            initial_pose_x,
+            "--y",
+            initial_pose_y,
+            "--yaw",
+            initial_pose_yaw,
+            "--use-sim-time",
+        ],
+        cwd=str(PROJECT_ROOT),
+        output="screen",
+    )
 
     return LaunchDescription(
         [
             SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "1"),
             DeclareLaunchArgument(
-                "nav2_params_file",
-                default_value=str(DEFAULT_NAV2_PARAMS),
-                description="Path to Nav2 params for SLAM profile.",
+                "params_file",
+                default_value=str(DEFAULT_PARAMS),
+                description="Path to Nav2 localization params.",
             ),
-            DeclareLaunchArgument(
-                "slam_params_file",
-                default_value=str(DEFAULT_SLAM_PARAMS),
-                description="Path to slam_toolbox params.",
-            ),
+            DeclareLaunchArgument("map", description="Path to saved occupancy map YAML."),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("log_level", default_value="info"),
             DeclareLaunchArgument("publish_lidar_tf", default_value="true"),
@@ -159,6 +149,9 @@ def generate_launch_description():
             DeclareLaunchArgument("scan_angle_min", default_value="-3.14159"),
             DeclareLaunchArgument("scan_angle_max", default_value="3.14159"),
             DeclareLaunchArgument("scan_range_max", default_value="10.0"),
+            DeclareLaunchArgument("initial_pose_x", default_value="-6.0"),
+            DeclareLaunchArgument("initial_pose_y", default_value="-1.0"),
+            DeclareLaunchArgument("initial_pose_yaw", default_value="0.0"),
             SetParameter("use_sim_time", use_sim_time),
             Node(
                 package="tf2_ros",
@@ -211,36 +204,46 @@ def generate_launch_description():
                     ("scan", "/scan"),
                 ],
             ),
-            slam_toolbox_node,
-            EmitEvent(
-                event=ChangeState(
-                    lifecycle_node_matcher=matches_action(slam_toolbox_node),
-                    transition_id=Transition.TRANSITION_CONFIGURE,
-                )
+            Node(
+                package="nav2_map_server",
+                executable="map_server",
+                name="map_server",
+                output="screen",
+                parameters=[params_file],
+                arguments=[
+                    "--ros-args",
+                    "-p",
+                    ["yaml_filename:=", map_yaml],
+                    "--log-level",
+                    log_level,
+                ],
             ),
-            RegisterEventHandler(
-                OnStateTransition(
-                    target_lifecycle_node=slam_toolbox_node,
-                    start_state="configuring",
-                    goal_state="inactive",
-                    entities=[
-                        LogInfo(msg="[LifecycleLaunch] slam_toolbox activating"),
-                        EmitEvent(
-                            event=ChangeState(
-                                lifecycle_node_matcher=matches_action(slam_toolbox_node),
-                                transition_id=Transition.TRANSITION_ACTIVATE,
-                            )
-                        ),
-                    ],
-                )
+            Node(
+                package="nav2_amcl",
+                executable="amcl",
+                name="amcl",
+                output="screen",
+                parameters=[params_file],
+                arguments=["--ros-args", "--log-level", log_level],
+                remappings=remappings,
             ),
-            nav2_waiter,
+            Node(
+                package="nav2_lifecycle_manager",
+                executable="lifecycle_manager",
+                name="lifecycle_manager_localization",
+                output="screen",
+                parameters=[params_file],
+                arguments=["--ros-args", "--log-level", log_level],
+            ),
+            TimerAction(period=3.0, actions=[initial_pose_publisher]),
+            nav2_ready_waiter,
             RegisterEventHandler(
                 OnProcessExit(
-                    target_action=nav2_waiter,
+                    target_action=nav2_ready_waiter,
                     on_exit=[
-                        LogInfo(msg="[LifecycleLaunch] SLAM ready gate passed; starting Nav2"),
+                        LogInfo(msg="[LocalizationLaunch] saved map ready; starting Nav2"),
                         *nav2_nodes,
+                        TimerAction(period=1.0, actions=[nav2_activator]),
                     ],
                 )
             ),

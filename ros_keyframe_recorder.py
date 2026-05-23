@@ -29,6 +29,12 @@ def yaw_from_quaternion(q) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def yaw_from_dict(q: dict) -> float:
+    siny_cosp = 2.0 * (float(q["w"]) * float(q["z"]) + float(q["x"]) * float(q["y"]))
+    cosy_cosp = 1.0 - 2.0 * (float(q["y"]) * float(q["y"]) + float(q["z"]) * float(q["z"]))
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
 def shortest_angle_delta(a: float, b: float) -> float:
     return math.atan2(math.sin(a - b), math.cos(a - b))
 
@@ -144,6 +150,9 @@ class KeyframeRecorder(Node):
 
         self.latest_odom: Optional[Odometry] = None
         self.last_saved_odom: Optional[Odometry] = None
+        self.last_saved_pose_frame: Optional[str] = None
+        self.last_saved_position: Optional[dict] = None
+        self.last_saved_orientation: Optional[dict] = None
         self.last_saved_time: Optional[float] = None
         self.saved_count = find_last_keyframe_index(self.images_dir)
 
@@ -171,20 +180,32 @@ class KeyframeRecorder(Node):
     def on_odom(self, msg: Odometry) -> None:
         self.latest_odom = msg
 
-    def should_save(self, image_time: float, odom: Odometry) -> bool:
-        if self.last_saved_odom is None or self.last_saved_time is None:
+    def should_save(
+        self,
+        image_time: float,
+        pose_frame: str,
+        position: dict,
+        orientation: dict,
+    ) -> bool:
+        if (
+            self.last_saved_position is None
+            or self.last_saved_orientation is None
+            or self.last_saved_time is None
+            or self.last_saved_pose_frame != pose_frame
+        ):
             return True
 
         dt = image_time - self.last_saved_time
         if dt < self.min_time_delta_sec:
             return False
 
-        p = odom.pose.pose.position
-        last_p = self.last_saved_odom.pose.pose.position
-        translation = math.hypot(p.x - last_p.x, p.y - last_p.y)
+        translation = math.hypot(
+            float(position["x"]) - float(self.last_saved_position["x"]),
+            float(position["y"]) - float(self.last_saved_position["y"]),
+        )
 
-        yaw = yaw_from_quaternion(odom.pose.pose.orientation)
-        last_yaw = yaw_from_quaternion(self.last_saved_odom.pose.pose.orientation)
+        yaw = yaw_from_dict(orientation)
+        last_yaw = yaw_from_dict(self.last_saved_orientation)
         rotation = abs(shortest_angle_delta(yaw, last_yaw))
 
         return (
@@ -249,14 +270,19 @@ class KeyframeRecorder(Node):
             )
             return
 
-        if not self.should_save(image_time, self.latest_odom):
-            return
-
         odom = self.latest_odom
         try:
             pose_frame, position, orientation = self.recorded_pose(odom)
         except (ValueError, TransformException) as exc:
             self.get_logger().warn(f"Skipping image: failed to resolve keyframe pose: {exc}")
+            return
+        if self.target_frame and pose_frame != self.target_frame:
+            self.get_logger().warn(
+                f"Skipping image: resolved pose_frame={pose_frame}, expected {self.target_frame}"
+            )
+            return
+
+        if not self.should_save(image_time, pose_frame, position, orientation):
             return
 
         try:
@@ -288,6 +314,7 @@ class KeyframeRecorder(Node):
             "child_frame_id": odom.child_frame_id,
             "pose_age_sec": pose_age,
             "pose": {"position": position, "orientation": orientation},
+            "pose_coordinate_contract": f"{pose_frame} coordinates for both recording and navigation",
             "source_pose_frame": odom.header.frame_id,
             "status": "active",
         }
@@ -295,6 +322,9 @@ class KeyframeRecorder(Node):
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         self.last_saved_odom = odom
+        self.last_saved_pose_frame = pose_frame
+        self.last_saved_position = position
+        self.last_saved_orientation = orientation
         self.last_saved_time = image_time
         self.get_logger().info(
             f"Saved {frame_id}: pose_frame={pose_frame}, source_frame={odom.header.frame_id}, "
