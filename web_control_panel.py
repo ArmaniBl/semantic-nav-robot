@@ -2,8 +2,10 @@
 import argparse
 import html
 import json
+import math
 import mimetypes
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -31,12 +33,21 @@ from tf2_ros import Buffer, TransformListener
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_IMAGE_TOPIC = "/front_stereo_camera/left/image_raw"
 RECORDINGS_DIR = PROJECT_ROOT / "data" / "recordings"
+MAPS_DIR = PROJECT_ROOT / "data" / "maps"
+DEFAULT_FIXED_MAP_YAML = MAPS_DIR / "semantic_visual_memory_run_20260521_144732" / "map.yaml"
+RUNTIME_STATE_PATH = PROJECT_ROOT / "data" / "runtime_state.json"
+WEB_LOGS_DIR = PROJECT_ROOT / "logs" / "web"
 MAX_SERVER_LOGS = 250
 EVENT_STREAM_INITIAL_BACKLOG = 80
 
 
 def stamp_to_sec(msg) -> float:
     return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+
+
+def make_web_event_log_path() -> Path:
+    WEB_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    return WEB_LOGS_DIR / f"events_{time.strftime('%Y%m%d_%H%M%S')}.log"
 
 
 def image_msg_to_bgr(msg: Image) -> np.ndarray:
@@ -76,6 +87,7 @@ class SharedState:
         self.latest_image_frame = ""
         self.frame_count = 0
         self.logs: deque[dict] = deque(maxlen=MAX_SERVER_LOGS)
+        self.log_path = make_web_event_log_path()
         self.next_log_id = 1
         self.nav_process: subprocess.Popen | None = None
         self.nav_started_at = 0.0
@@ -119,6 +131,11 @@ class SharedState:
             }
             self.next_log_id += 1
             self.logs.append(item)
+            with self.log_path.open("a", encoding="utf-8") as file:
+                file.write(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"{source}: {line}\n"
+                )
 
     def is_noisy_log(self, line: str) -> bool:
         noisy_patterns = (
@@ -197,6 +214,9 @@ class SharedState:
                 },
                 "qdrant": dict(self.qdrant_status),
                 "system": system_snapshot,
+                "logs": {
+                    "events_path": str(self.log_path),
+                },
             }
 
     def set_system_status(self, status: dict) -> None:
@@ -224,7 +244,7 @@ class SharedState:
         parts = []
         if not status.get("clock_topic"):
             parts.append("missing /clock publisher")
-        if not status.get("map_topic"):
+        if self.app_args.goal_frame != "odom" and not status.get("map_topic"):
             parts.append("missing /map")
         if not status.get("navigate_action"):
             parts.append("missing /navigate_to_pose")
@@ -234,7 +254,7 @@ class SharedState:
             parts.append(str(qdrant.get("summary", "Qdrant unknown")))
         if parts:
             return False, "; ".join(parts)
-        return True, "Nav2 action/map and Qdrant ready"
+        return True, "Nav2 action and Qdrant ready"
 
     def recording_ready(self) -> tuple[bool, str]:
         with self.lock:
@@ -243,7 +263,7 @@ class SharedState:
         parts = []
         if not status.get("clock_topic"):
             parts.append("missing /clock publisher")
-        if not status.get("map_topic"):
+        if self.app_args.goal_frame != "odom" and not status.get("map_topic"):
             parts.append("missing /map")
         if not status.get("goal_frame"):
             parts.append(f"missing {self.app_args.goal_frame}->{self.app_args.robot_base_frame}")
@@ -251,7 +271,7 @@ class SharedState:
             parts.append(str(qdrant.get("summary", "Qdrant unknown")))
         if parts:
             return False, "; ".join(parts)
-        return True, "SLAM map/TF and Qdrant ready"
+        return True, "Nav2 TF and Qdrant ready"
 
     def set_qdrant_status(self, status: dict) -> None:
         with self.lock:
@@ -329,14 +349,14 @@ class CameraSubscriber(Node):
         missing = []
         if not clock_topic:
             missing.append("/clock publisher")
-        if not map_topic:
+        if self.args.goal_frame != "odom" and not map_topic:
             missing.append(self.args.map_topic)
         if not navigate_action:
             missing.append(self.args.action_name)
         if not goal_frame:
             missing.append(f"{self.args.goal_frame}->{self.args.robot_base_frame}")
         ready = not missing
-        summary = "SLAM/Nav2 ready" if ready else "Missing: " + ", ".join(missing)
+        summary = "Nav2 ready" if ready else "Missing: " + ", ".join(missing)
         self.state.set_system_status(
             {
                 "clock_topic": clock_topic,
@@ -393,12 +413,17 @@ def build_nav_command(args: argparse.Namespace, query: str) -> list[str]:
         str(args.top_k),
         "--goal-frame",
         args.goal_frame,
+        "--require-stored-goal-frame",
         "--map-topic",
         args.map_topic,
         "--global-costmap-topic",
         args.global_costmap_topic,
+        "--max-collection-map-step-m",
+        str(args.record_max_map_step_m),
         "--action-name",
         args.action_name,
+        "--use-sim-time",
+        "--goal-stamp-latest",
         "--robot-base-frame",
         args.robot_base_frame,
         "--image-topic",
@@ -411,19 +436,79 @@ def build_nav_command(args: argparse.Namespace, query: str) -> list[str]:
         str(args.result_timeout_sec),
         "--feedback-log-period-sec",
         str(args.feedback_log_period_sec),
+        "--front-obstacle-stop-distance-m",
+        str(args.front_obstacle_stop_distance_m),
+        "--front-obstacle-angle-deg",
+        str(args.front_obstacle_angle_deg),
+        "--client-arrival-stop-distance-m",
+        str(args.client_arrival_stop_distance_m),
+        "--max-candidate-attempts",
+        "3",
     ]
     if args.max_goal_distance and args.max_goal_distance > 0.0:
         command.extend(["--max-goal-distance", str(args.max_goal_distance)])
     return command
 
 
-def build_slam_command(args: argparse.Namespace) -> list[str]:
+def build_mapping_command(args: argparse.Namespace) -> list[str]:
     return [
         "ros2",
         "launch",
         str(PROJECT_ROOT / "launch" / "slam_nav2_launch.py"),
         "log_level:=" + args.slam_log_level,
     ]
+
+
+def build_localization_command(args: argparse.Namespace, map_yaml: Path) -> list[str]:
+    return [
+        "ros2",
+        "launch",
+        str(PROJECT_ROOT / "launch" / "localization_nav2_launch.py"),
+        "map:=" + str(map_yaml),
+        "initial_pose_x:=" + str(args.initial_pose_x),
+        "initial_pose_y:=" + str(args.initial_pose_y),
+        "initial_pose_yaw:=" + str(args.initial_pose_yaw),
+        "log_level:=" + args.slam_log_level,
+    ]
+
+
+def build_odom_nav2_command(args: argparse.Namespace) -> list[str]:
+    return [
+        "ros2",
+        "launch",
+        str(PROJECT_ROOT / "launch" / "nav2_odom_launch.py"),
+        "log_level:=" + args.slam_log_level,
+    ]
+
+
+def valid_saved_map_yaml(raw_path: str) -> Path | None:
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if resolved.suffix.lower() != ".yaml":
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def build_slam_command(args: argparse.Namespace) -> tuple[list[str], str, dict | None]:
+    if args.goal_frame == "odom":
+        return build_odom_nav2_command(args), "odom-nav2", None
+
+    map_info = fixed_map_info(args, args.collection)
+    map_yaml = valid_saved_map_yaml(str(map_info.get("map_yaml") or ""))
+    if map_yaml is not None and map_info.get("exists"):
+        return build_localization_command(args, map_yaml), "fixed-localization", map_info
+    raise FileNotFoundError(
+        f"Fixed map YAML or image is missing: {map_info.get('map_yaml')}"
+    )
 
 
 def build_qdrant_start_command() -> list[str]:
@@ -469,6 +554,7 @@ def build_record_command(args: argparse.Namespace, keyframes_dir: Path) -> list[
         args.goal_frame,
         "--tf-timeout-sec",
         str(args.record_tf_timeout_sec),
+        "--no-allow-latest-tf-fallback",
     ]
 
 
@@ -549,12 +635,168 @@ def run_command_capture(command: list[str], timeout_sec: float) -> str:
     return output
 
 
-def add_recording_run_id(metadata_path: Path, run_id: str) -> int:
+def read_runtime_state() -> dict:
+    if not RUNTIME_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(RUNTIME_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_runtime_state(args: argparse.Namespace) -> None:
+    RUNTIME_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "collection": args.collection,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    temp_path = RUNTIME_STATE_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(RUNTIME_STATE_PATH)
+
+
+def sanitize_path_part(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return clean.strip("._") or "collection"
+
+
+def configured_fixed_map_yaml(args: argparse.Namespace) -> Path:
+    path = Path(args.fixed_map_yaml).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def map_image_path_from_yaml(map_yaml: Path) -> Path | None:
+    try:
+        lines = map_yaml.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or not stripped.startswith("image:"):
+            continue
+        raw_value = stripped.split(":", 1)[1].strip().strip("'\"")
+        if not raw_value:
+            return None
+        image_path = Path(raw_value).expanduser()
+        if not image_path.is_absolute():
+            image_path = map_yaml.parent / image_path
+        return image_path
+    return None
+
+
+def fixed_map_info(args: argparse.Namespace, collection_name: str = "") -> dict:
+    map_yaml = configured_fixed_map_yaml(args)
+    resolved_yaml = valid_saved_map_yaml(str(map_yaml))
+    image_path = map_image_path_from_yaml(resolved_yaml or map_yaml)
+    image_exists = image_path is not None and image_path.exists()
+    return {
+        "collection": collection_name,
+        "map_yaml": str(map_yaml),
+        "map_image": str(image_path) if image_exists else "",
+        "exists": resolved_yaml is not None and image_exists,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "fixed": True,
+    }
+
+
+def require_fixed_map_info(args: argparse.Namespace, collection_name: str) -> dict:
+    info = fixed_map_info(args, collection_name)
+    if not info.get("exists"):
+        raise FileNotFoundError(
+            f"Fixed map YAML or image is missing: {info.get('map_yaml')}"
+        )
+    return info
+
+
+def yaw_from_pose_record(record: dict) -> float:
+    orientation = ((record.get("pose") or {}).get("orientation") or {})
+    x = float(orientation.get("x", 0.0))
+    y = float(orientation.get("y", 0.0))
+    z = float(orientation.get("z", 0.0))
+    w = float(orientation.get("w", 1.0))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def shortest_angle_delta(left: float, right: float) -> float:
+    return math.atan2(math.sin(left - right), math.cos(left - right))
+
+
+def validate_recording_pose_continuity(args: argparse.Namespace, metadata_path: Path) -> dict:
+    records = read_jsonl(metadata_path)
+    if not records:
+        raise ValueError(f"Recording has no records: {metadata_path}")
+
+    max_step = 0.0
+    max_rotation = 0.0
+    worst_step = None
+    previous = None
+    for record in records:
+        pose_frame = str(record.get("pose_frame") or "")
+        if pose_frame != args.goal_frame:
+            raise ValueError(
+                f"Recording contains pose_frame={pose_frame!r}, expected {args.goal_frame!r} "
+                f"at {record.get('memory_id')}"
+            )
+        if previous is None:
+            previous = record
+            continue
+
+        position = (record.get("pose") or {}).get("position") or {}
+        previous_position = (previous.get("pose") or {}).get("position") or {}
+        dx = float(position.get("x", 0.0)) - float(previous_position.get("x", 0.0))
+        dy = float(position.get("y", 0.0)) - float(previous_position.get("y", 0.0))
+        step = math.hypot(dx, dy)
+        rotation = abs(shortest_angle_delta(yaw_from_pose_record(record), yaw_from_pose_record(previous)))
+        max_step = max(max_step, step)
+        max_rotation = max(max_rotation, rotation)
+        if step > args.record_max_map_step_m:
+            worst_step = (
+                previous.get("memory_id"),
+                record.get("memory_id"),
+                step,
+            )
+            break
+        previous = record
+
+    if worst_step is not None:
+        before, after, step = worst_step
+        raise RuntimeError(
+            "Pose jump detected in recording: "
+            f"{before} -> {after} moved {step:.2f} m in {args.goal_frame} frame. "
+            "Reset the simulation/localization and record again."
+        )
+
+    return {
+        "localization_valid": True,
+        "max_pose_step_m": max_step,
+        "max_pose_rotation_rad": max_rotation,
+    }
+
+
+def add_recording_session_metadata(
+    metadata_path: Path,
+    run_id: str,
+    map_info: dict | None,
+    pose_validation: dict | None,
+) -> int:
     records = read_jsonl(metadata_path)
     temp_path = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
     with temp_path.open("w", encoding="utf-8") as file:
         for record in records:
             record["run_id"] = run_id
+            if pose_validation:
+                record["localization_valid"] = bool(pose_validation.get("localization_valid"))
+                record["max_run_pose_step_m"] = pose_validation.get("max_pose_step_m")
+                record["max_run_pose_rotation_rad"] = pose_validation.get("max_pose_rotation_rad")
+            if map_info:
+                record["map"] = {
+                    "collection": map_info.get("collection"),
+                    "saved_at": map_info.get("saved_at"),
+                }
+                record["map_yaml"] = map_info.get("map_yaml") or ""
+                record["map_image"] = map_info.get("map_image") or ""
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
     temp_path.replace(metadata_path)
     return len(records)
@@ -567,7 +809,9 @@ def load_recording_into_qdrant(args: argparse.Namespace, run_dir: Path, collecti
         raise FileNotFoundError(f"Recording has no metadata: {metadata_path}")
     if not collection_name:
         raise ValueError("target collection is empty")
-    record_count = add_recording_run_id(metadata_path, run_dir.name)
+    map_info = require_fixed_map_info(args, collection_name)
+    pose_validation = validate_recording_pose_continuity(args, metadata_path)
+    record_count = add_recording_session_metadata(metadata_path, run_dir.name, map_info, pose_validation)
     embeddings_path = keyframes_dir / "embeddings.jsonl"
     python_path = PROJECT_ROOT / ".ruclip_venv" / "bin" / "python"
 
@@ -602,6 +846,9 @@ def load_recording_into_qdrant(args: argparse.Namespace, run_dir: Path, collecti
         "records": record_count,
         "metadata": str(metadata_path),
         "embeddings": str(embeddings_path),
+        "map": map_info,
+        "pose_validation": pose_validation,
+        "map_output": map_info.get("map_output", ""),
         "embed_output": embed_output,
         "load_output": load_output,
     }
@@ -625,6 +872,21 @@ def delete_qdrant_collection(args: argparse.Namespace, collection_name: str) -> 
             raise RuntimeError(f"Qdrant returned HTTP {response.status}")
 
 
+def delete_local_collection_artifacts(collection_name: str) -> None:
+    state = read_runtime_state()
+    if state.get("collection") == collection_name:
+        try:
+            RUNTIME_STATE_PATH.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def qdrant_collection_map(args: argparse.Namespace, collection_name: str) -> dict | None:
+    if not collection_name:
+        return None
+    return fixed_map_info(args, collection_name)
+
+
 def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
     limit = max(1, min(args.memory_limit, 512))
     collections = qdrant_collections(args)
@@ -635,6 +897,7 @@ def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
             "collection": args.collection,
             "collections": collections,
             "collection_missing": True,
+            "collection_map": fixed_map_info(args, args.collection),
             "next_page_offset": None,
             "qdrant_run_counts": {},
         }
@@ -657,6 +920,7 @@ def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
     points = (data.get("result") or {}).get("points") or []
     items = [point_payload_to_memory_item(point) for point in points]
     run_counts: dict[str, int] = {}
+    collection_map = fixed_map_info(args, args.collection)
     for item in items:
         run_id = item.get("run_id") or "<unknown>"
         run_counts[run_id] = run_counts.get(run_id, 0) + 1
@@ -666,6 +930,7 @@ def qdrant_scroll_memory(args: argparse.Namespace) -> dict:
         "collection": args.collection,
         "collections": collections,
         "collection_missing": False,
+        "collection_map": collection_map,
         "next_page_offset": (data.get("result") or {}).get("next_page_offset"),
         "qdrant_run_counts": run_counts,
     }
@@ -778,22 +1043,35 @@ def finalize_recording(
             f"embedding and loading recording into Qdrant: {run_dir.name} -> {collection_name}",
         )
         result = load_recording_into_qdrant(args, run_dir, collection_name)
+        for line in (result.get("map_output") or "").splitlines():
+            state.add_log("record", line)
         for line in (result.get("embed_output") or "").splitlines():
             state.add_log("record", line)
         for line in (result.get("load_output") or "").splitlines():
             state.add_log("record", line)
         with state.lock:
             args.collection = result["collection"]
+            write_runtime_state(args)
             state.record_last_result = {
                 "ok": True,
                 "run": result["run"],
                 "records": result["records"],
                 "collection": result["collection"],
+                "map": result.get("map"),
+                "pose_validation": result.get("pose_validation"),
             }
         state.add_log(
             "record",
             f"recording loaded: run={result['run']} records={result['records']} collection={result['collection']}",
         )
+        if result.get("pose_validation"):
+            validation = result["pose_validation"]
+            state.add_log(
+                "record",
+                f"pose continuity ok: max_step={validation.get('max_pose_step_m', 0.0):.2f}m",
+            )
+        if result.get("map"):
+            state.add_log("record", f"attached fixed map: {result['map'].get('map_yaml')}")
     except Exception as exc:
         with state.lock:
             state.record_last_result = {"ok": False, "error": str(exc), "run": run_dir.name}
@@ -1046,7 +1324,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 ready, summary = self.state.navigation_request_ready()
                 if not ready:
                     message = (
-                        "Navigation request is not ready. Start SLAM/Nav2 "
+                        "Navigation request is not ready. Start Map/Nav2 "
                         "and Qdrant first. "
                         f"{summary}"
                     )
@@ -1112,9 +1390,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 system_status = dict(self.state.system_status)
                 if running:
                     already_running = True
-                elif (
-                    system_status.get("map_topic")
-                    and system_status.get("navigate_action")
+                elif system_status.get("navigate_action") and (
+                    self.app_args.goal_frame == "odom" or system_status.get("map_topic")
                 ):
                     already_external = True
                     external_log_needed = True
@@ -1122,7 +1399,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                     command = None
                     proc = None
                 else:
-                    command = build_slam_command(self.app_args)
+                    command, slam_mode, map_info = build_slam_command(self.app_args)
                     env = os.environ.copy()
                     env.setdefault("PYTHONUNBUFFERED", "1")
                     proc = subprocess.Popen(
@@ -1155,6 +1432,18 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return
 
             assert command is not None and proc is not None
+            if slam_mode == "fixed-localization":
+                self.state.add_log(
+                    "web",
+                    f"fixed map ready; starting localization/Nav2: {map_info.get('map_yaml') if map_info else ''}",
+                )
+            elif slam_mode == "odom-nav2":
+                self.state.add_log(
+                    "web",
+                    "starting odom-frame Nav2; semantic goals stay in odom coordinates",
+                )
+            else:
+                self.state.add_log("web", "starting SLAM/Nav2")
             self.state.add_log("web", "started SLAM/Nav2: " + " ".join(shlex.quote(part) for part in command))
             threading.Thread(
                 target=stream_process_output,
@@ -1265,8 +1554,27 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return
             with self.state.lock:
                 self.app_args.collection = collection
+                write_runtime_state(self.app_args)
             self.state.add_log("qdrant", f"selected collection: {collection}")
-            self.send_json({"ok": True, "collection": collection, "collections": collections})
+            try:
+                map_info = qdrant_collection_map(self.app_args, collection)
+            except Exception as exc:
+                map_info = None
+                self.state.add_log("qdrant", f"failed to inspect fixed map: {exc}")
+            if map_info and map_info.get("exists"):
+                self.state.add_log("qdrant", f"fixed map ready: {map_info.get('map_yaml')}")
+            elif map_info:
+                self.state.add_log("qdrant", f"fixed map YAML or image missing on disk: {map_info.get('map_yaml')}")
+            else:
+                self.state.add_log("qdrant", "fixed map is not configured")
+            self.send_json(
+                {
+                    "ok": True,
+                    "collection": collection,
+                    "collections": collections,
+                    "collection_map": map_info,
+                }
+            )
         except Exception as exc:
             self.state.add_log("qdrant", f"Failed to select collection: {exc}")
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1297,10 +1605,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                 )
                 return
             delete_qdrant_collection(self.app_args, collection)
+            delete_local_collection_artifacts(collection)
             collections = qdrant_collections(self.app_args)
             with self.state.lock:
                 if self.app_args.collection == collection:
                     self.app_args.collection = collections[0] if collections else self.app_args.initial_collection
+                    write_runtime_state(self.app_args)
             self.state.add_log("qdrant", f"deleted collection: {collection}")
             self.send_json(
                 {
@@ -2047,7 +2357,7 @@ INDEX_HTML = r"""<!doctype html>
             <button id="stopQdrant" class="secondary danger">Stop Qdrant</button>
           </div>
           <div class="button-row">
-            <button id="startSlam" class="secondary">Start SLAM/Nav2</button>
+            <button id="startSlam" class="secondary">Start Map/Nav2</button>
             <button id="stopSlam" class="secondary danger">Stop SLAM/Nav2</button>
           </div>
           <div class="button-row">
@@ -2172,6 +2482,13 @@ INDEX_HTML = r"""<!doctype html>
       return `Qdrant source: ${entries.map(([run, count]) => `${run} (${count})`).join(", ")}`;
     }
 
+    function mapInfo(collectionMap) {
+      if (!collectionMap || !collectionMap.map_yaml) return "fixed map: not configured";
+      return collectionMap.exists
+        ? `fixed map: ${collectionMap.map_yaml}`
+        : `fixed map YAML/image missing: ${collectionMap.map_yaml}`;
+    }
+
     function populateCollectionSelector(collections, selectedCollection) {
       const select = $("collectionSelect");
       const previous = select.value;
@@ -2201,7 +2518,7 @@ INDEX_HTML = r"""<!doctype html>
       const selectedLabel = data.collection || "-";
       const errorLabel = data.qdrant_error ? ` · ${data.qdrant_error}` : "";
       const missingLabel = activeCollectionMissing ? " · collection missing" : "";
-      $("collectionInfo").textContent = `${selectedLabel} · ${qdrantInfo(data.qdrant_run_counts)}${missingLabel}${errorLabel}`;
+      $("collectionInfo").textContent = `${selectedLabel} · ${qdrantInfo(data.qdrant_run_counts)} · ${mapInfo(data.collection_map)}${missingLabel}${errorLabel}`;
       $("sideMemory").textContent = `${selectedLabel} · ${items.length} images`;
       if (!items.length) {
         const empty = document.createElement("div");
@@ -2312,13 +2629,11 @@ INDEX_HTML = r"""<!doctype html>
         $("slamRuntime").textContent = slam.runtime_sec === null ? "-" : `${slam.runtime_sec}s`;
         $("systemState").textContent = system.ready ? "ready" : system.summary;
         $("tfState").textContent = system.goal_frame
-          ? (system.clock_topic ? "map -> base_link" : "no /clock")
+          ? (system.clock_topic ? "goal frame -> base_link" : "no /clock")
           : "missing";
         $("frames").textContent = String(camera.frame_count);
         $("imageFrame").textContent = camera.image_frame || "-";
-        const navRequestReady = Boolean(
-          system.clock_topic && system.map_topic && system.navigate_action && qdrant.ready
-        );
+        const navRequestReady = Boolean(system.ready && qdrant.ready);
         const recordBusy = Boolean(recording.running || recording.finalizing);
         $("go").disabled = nav.running || recordBusy || !navRequestReady;
         $("stop").disabled = !nav.running;
@@ -2326,7 +2641,7 @@ INDEX_HTML = r"""<!doctype html>
         $("stopQdrant").disabled = !qdrant.ready || recordBusy;
         $("startSlam").disabled = slam.running || recordBusy;
         $("stopSlam").disabled = !slam.running || recordBusy;
-        $("startRecord").disabled = nav.running || recordBusy || !qdrant.ready || !system.clock_topic || !system.map_topic || !system.goal_frame;
+        $("startRecord").disabled = nav.running || recordBusy || !qdrant.ready || !system.ready;
         $("stopRecord").disabled = !recording.running;
         $("deleteCollection").disabled = recordBusy || nav.running || activeCollectionMissing || !$("collectionSelect").value || !qdrant.ready;
       } catch (err) {
@@ -2468,6 +2783,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-base-frame", default="base_link")
     parser.add_argument("--qdrant-url", default="http://127.0.0.1:6333")
     parser.add_argument("--collection", default="semantic_visual_memory")
+    parser.add_argument(
+        "--fixed-map-yaml",
+        default=str(DEFAULT_FIXED_MAP_YAML),
+        help="Fixed occupancy map YAML used for all collections.",
+    )
     parser.add_argument("--qdrant-timeout-sec", type=float, default=2.0)
     parser.add_argument("--memory-limit", type=int, default=200)
     parser.add_argument("--memory-search-timeout-sec", type=float, default=45.0)
@@ -2483,7 +2803,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--client-timeout-sec", type=float, default=6.0)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--goal-frame", default="map")
+    parser.add_argument("--goal-frame", default="odom")
     parser.add_argument("--mission-match-threshold", type=float, default=0.30)
     parser.add_argument("--mission-check-period-sec", type=float, default=1.5)
     parser.add_argument(
@@ -2499,13 +2819,31 @@ def parse_args() -> argparse.Namespace:
         help="0 disables client-side Nav2 result timeout.",
     )
     parser.add_argument("--feedback-log-period-sec", type=float, default=4.0)
+    parser.add_argument("--front-obstacle-stop-distance-m", type=float, default=0.85)
+    parser.add_argument("--front-obstacle-angle-deg", type=float, default=70.0)
+    parser.add_argument("--client-arrival-stop-distance-m", type=float, default=0.20)
     parser.add_argument("--slam-log-level", default="info")
+    parser.add_argument("--initial-pose-x", type=float, default=-6.0)
+    parser.add_argument("--initial-pose-y", type=float, default=-1.0)
+    parser.add_argument("--initial-pose-yaw", type=float, default=0.0)
     parser.add_argument("--record-odom-topic", default="/chassis/odom")
     parser.add_argument("--record-min-time-delta-sec", type=float, default=1.0)
     parser.add_argument("--record-min-translation-delta-m", type=float, default=0.25)
     parser.add_argument("--record-min-rotation-delta-rad", type=float, default=0.25)
     parser.add_argument("--record-max-pose-age-sec", type=float, default=0.25)
     parser.add_argument("--record-tf-timeout-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--record-max-map-step-m",
+        type=float,
+        default=5.0,
+        help="Reject DB recordings if consecutive goal-frame keyframes jump farther than this.",
+    )
+    parser.add_argument(
+        "--map-save-timeout-sec",
+        type=float,
+        default=60.0,
+        help="Deprecated: maps are no longer saved automatically after DB recording.",
+    )
     parser.add_argument(
         "--record-collection-prefix",
         default="semantic_visual_memory_",
@@ -2521,13 +2859,17 @@ def parse_args() -> argparse.Namespace:
         "--require-nav-ready",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Reject web navigation requests until /map, /navigate_to_pose, and map->base_link are available.",
+        help="Reject web navigation requests until Nav2, Qdrant, and the selected goal-frame TF are available.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    saved_state = read_runtime_state()
+    saved_collection = str(saved_state.get("collection") or "").strip()
+    if args.collection == "semantic_visual_memory" and saved_collection:
+        args.collection = saved_collection
     args.initial_collection = args.collection
     state = SharedState()
     state.app_args = args

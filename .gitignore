@@ -21,6 +21,7 @@ qdrant_storage/
 build/
 install/
 log/
+logs/
 *.bag
 *.db3
 
@@ -28,6 +29,7 @@ log/
 data/keyframes/
 data/recordings/
 data/maps/
+data/runtime_state.json
 
 # Local logs and scratch files
 *.log

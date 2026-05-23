@@ -2,61 +2,47 @@
 
 ## Состояние Runtime
 
-Проект переведен на ручной workflow semantic navigation:
+Проект работает в ручном workflow через web-панель:
 
-- autonomous frontier exploration удален из runtime;
 - web-панель является основной точкой управления;
-- semantic memory создается через ручную DB recording-сессию;
-- Nav2 стартует только после готовности SLAM `/map` и TF;
-- `Go` отправляет одну выбранную semantic goal-точку и не переключается на другие candidates по умолчанию;
-- во время движения live camera проверяется RuCLIP’ом, и миссия может завершиться раньше координатной цели, если визуальный запрос совпал.
+- Qdrant запускается и останавливается из UI;
+- Nav2 запускается в `odom`-frame профиле;
+- база наблюдений создается через ручную DB recording-сессию;
+- `Go` отправляет выбранную goal-точку и при необходимости пробует до 3 candidates;
+- во время движения live camera проверяется по текстовому запросу;
+- порог совпадения зависит от количества слов в запросе;
+- после прибытия робот поворачивается на месте до 360 градусов;
+- при совпадении во время поворота робот сразу останавливается.
 
 ## Основные Изменения
 
 - `web_control_panel.py`
-  - управление Qdrant, SLAM/Nav2, DB recording, semantic navigation;
+  - управление Qdrant, Nav2, DB recording и navigation mission;
   - просмотр и удаление Qdrant collections;
-  - проверка `/clock`, `/map`, `/navigate_to_pose`, TF `map -> base_link`;
-  - защита от использования старой collection до текущего SLAM-сеанса.
+  - проверка `/clock`, `/navigate_to_pose`, TF `goal_frame -> base_link`;
+  - сохранение последней выбранной collection в `data/runtime_state.json`.
 
 - `semantic_nav_to_pose.py`
   - поиск visual memory в Qdrant;
-  - отправка точных координат в Nav2;
-  - live visual mission completion по камере;
-  - расшифровка Nav2 error codes;
-  - один selected candidate на mission run по умолчанию.
+  - отправка координат в Nav2;
+  - проверка live camera во время движения;
+  - динамический порог совпадения по количеству слов;
+  - client-side arrival stop по `distance_remaining`;
+  - поворот после прибытия с контролем угла по TF yaw;
+  - немедленная остановка поворота при совпадении;
+  - расшифровка Nav2 error codes.
 
 - `ros_keyframe_recorder.py`
   - запись image + pose metadata;
   - сохранение pose в target frame;
   - подавление штатного `ExternalShutdownException` при остановке.
 
-- `launch/slam_nav2_launch.py`
-  - запуск `wait_for_slam_ready.py` перед Nav2;
-  - Nav2 не стартует, пока нет `/clock`, `/scan`, `/map`, TF.
+- `launch/nav2_odom_launch.py`
+  - основной launch runtime для текущего workflow.
 
-- `config/nav2_slam_params.yaml`
-  - более спокойный профиль Regulated Pure Pursuit;
-  - большая rolling global costmap;
-  - увеличенный lifecycle `bond_timeout`.
-
-- `obstacle_right_turn.py`
-  - простой независимый тест: ехать вперед и поворачивать вправо на 90 градусов при препятствии.
-
-## Очистка
-
-Удалены из runtime:
-
-- `frontier_explorer.py`
-- `exploration_mission.py`
-- старые tracked maps в `data/maps/`
-
-Локальный мусор удален из рабочей директории:
-
-- `__pycache__/`
-- `launch/__pycache__/`
-- Windows `Zone.Identifier`
-- неиспользуемый untracked `example_scene.usd`
+- `config/nav2_odom_params.yaml`
+  - спокойный профиль движения;
+  - параметры planner/controller для локальной схемы координат.
 
 ## Проверки
 
@@ -64,14 +50,13 @@
 python3 -m py_compile \
   web_control_panel.py \
   ros_keyframe_recorder.py \
-  ruclip_embed_keyframes.py \
   qdrant_load_keyframes.py \
   semantic_nav_to_pose.py \
   semantic_search_qdrant.py \
   semantic_search_offline.py \
-  obstacle_right_turn.py \
   wait_for_slam_ready.py \
   launch/slam_nav2_launch.py \
+  launch/localization_nav2_launch.py \
   launch/nav2_odom_launch.py
 
 bash -n restart_semantic_nav.sh stop_all.sh
@@ -81,5 +66,5 @@ bash -n restart_semantic_nav.sh stop_all.sh
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-ros2 launch launch/slam_nav2_launch.py --show-args
+ros2 launch launch/nav2_odom_launch.py --show-args
 ```

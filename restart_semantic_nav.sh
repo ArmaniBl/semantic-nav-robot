@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8765}"
-WEB_LOG="${WEB_LOG:-/tmp/semantic_nav_web.log}"
+WEB_LOG="${WEB_LOG:-$PROJECT_DIR/logs/web/process.log}"
 WEB_URL="http://${HOST}:${PORT}"
 
 cd "$PROJECT_DIR"
@@ -72,7 +72,11 @@ log "stopping project processes"
 stop_pattern "${PROJECT_DIR}/ros_keyframe_recorder.py"
 stop_pattern "${PROJECT_DIR}/semantic_nav_to_pose.py"
 stop_pattern "${PROJECT_DIR}/launch/slam_nav2_launch.py"
+stop_pattern "${PROJECT_DIR}/launch/localization_nav2_launch.py"
+stop_pattern "${PROJECT_DIR}/launch/nav2_odom_launch.py"
 stop_pattern "/slam_toolbox/async_slam_toolbox_node"
+stop_pattern "/nav2_map_server/map_server"
+stop_pattern "/nav2_amcl/amcl"
 stop_pattern "/nav2_controller/controller_server"
 stop_pattern "/nav2_planner/planner_server"
 stop_pattern "/nav2_behaviors/behavior_server"
@@ -89,6 +93,7 @@ docker compose -f "$PROJECT_DIR/compose.qdrant.yml" down
 docker compose -f "$PROJECT_DIR/compose.qdrant.yml" up -d
 
 log "starting web panel: ${WEB_URL}"
+mkdir -p "$(dirname "$WEB_LOG")"
 : > "$WEB_LOG"
 setsid bash -lc "cd '$PROJECT_DIR' && source '$ROS_SETUP' && exec python3 web_control_panel.py --host '$HOST' --port '$PORT'" \
   > "$WEB_LOG" 2>&1 < /dev/null &
@@ -99,7 +104,7 @@ if ! wait_http "${WEB_URL}/api/status" 20; then
   exit 1
 fi
 
-log "starting SLAM/Nav2"
+log "starting Map/Nav2"
 curl -fsS --max-time 10 -X POST "${WEB_URL}/api/slam/start" >/dev/null
 
 log "waiting for status"
