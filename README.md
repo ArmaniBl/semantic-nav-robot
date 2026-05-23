@@ -399,9 +399,11 @@ ros2 launch launch/nav2_odom_launch.py --show-args
 - виртуальные окружения;
 - Qdrant storage;
 - recordings/keyframes;
-- local map files in `data/maps/`;
 - local runtime state in `data/runtime_state.json`;
 - Python/ROS build caches;
 - local logs.
 
 Это настроено в `.gitignore`.
+
+Карта в `data/maps/` хранится в репозитории, чтобы примерный runtime можно было
+восстановить после клонирования проекта.
